@@ -95,7 +95,7 @@ Single-file Streamlit app. No database. State is the uploaded file.
 
 ## Origin
 
-PlanSignal IVaR is the upstream-materials counterpart to [PlanSignal v1](https://plansignal.streamlit.app), which handles finished-goods forecast risk. Both are portfolio projects built by [George Onet](https://www.linkedin.com/in/georgeonet/) (Rascal) — a supply chain practitioner with 7+ years in chemical and pharmaceutical planning, documenting the build journey publicly on LinkedIn.
+PlanSignal IVaR is the upstream-materials counterpart to [PlanSignal v1](https://plansignal.streamlit.app), which handles finished-goods forecast risk. Both are portfolio projects built by [George Onet](https://www.linkedin.com/in/georgeonet/)  — a supply chain professional with 7+ years in chemical manufacturing, documenting the build journey publicly on LinkedIn.
 
 The model reflects choices a planner makes daily. The code reflects choices a self-taught Python builder makes weekly. Both are open to scrutiny.
 
