@@ -550,7 +550,7 @@ LOGO_IVAR  = "PlanSignal_IVaR_light.png"
 LOGO_LIGHT = "PlanSignal_light_.PNG"
 
 if os.path.exists(LOGO_IVAR):
-    st.image(LOGO_IVAR, width=420)
+    st.image(LOGO_IVAR, width=300)
 elif os.path.exists(LOGO_LIGHT):
     col_logo, col_hdr = st.columns([1, 6])
     with col_logo:
