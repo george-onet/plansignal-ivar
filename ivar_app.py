@@ -448,7 +448,7 @@ st.set_page_config(page_title="PlanSignal IVaR", layout="wide")
 
 st.markdown("""
 <style>
-.block-container { padding-top: 2.5rem; padding-bottom: 2rem; }
+.block-container { padding-top: 4rem; padding-bottom: 6rem; }
 .ivar-title      { font-size: 2.2rem; font-weight: 800; letter-spacing: -0.5px; margin-bottom: 0; }
 .ivar-sub        { color: #5f6368; font-size: 1.0rem; margin-bottom: 0.5rem; }
 .dim-note        { color: #5f6368; font-size: 0.88rem; margin-bottom: 0.4rem; }
@@ -552,7 +552,7 @@ LOGO_IVAR  = "PlanSignal_IVaR_light.png"
 LOGO_LIGHT = "PlanSignal_light_.PNG"
 
 if os.path.exists(LOGO_IVAR):
-    st.image(LOGO_IVAR, width=300)
+    st.image(LOGO_IVAR, width=240)
 elif os.path.exists(LOGO_LIGHT):
     col_logo, col_hdr = st.columns([1, 6])
     with col_logo:
@@ -1025,20 +1025,43 @@ table_df.rename(columns={
 for c in [v for v in RISK_LABELS.values() if v in table_df.columns]:
     table_df[c] = table_df[c].round(0)
 
+# Per-column heatmap coloring. Each numeric column scaled to its own max so colors
+# stay meaningful within-column instead of being flattened by Total IVaR's larger range.
+_numeric_cols = [v for v in RISK_LABELS.values() if v in table_df.columns]
+
+def _style_numeric_cols(df: pd.DataFrame):
+    styler = df.style
+    for col in _numeric_cols:
+        col_max = df[col].max()
+        if col_max and col_max > 0:
+            # Total IVaR uses deeper Reds to anchor it as the headline column.
+            # Dimension columns use lighter OrRd to read as secondary.
+            cmap = "Reds" if col == "Total IVaR (€)" else "OrRd"
+            styler = styler.background_gradient(
+                subset=[col],
+                cmap=cmap,
+                vmin=0,
+                vmax=col_max,
+            )
+    # EUR formatting applied via Styler so it survives alongside the gradient.
+    fmt = {c: "€{:,.0f}" for c in _numeric_cols}
+    styler = styler.format(fmt)
+    return styler
+
 st.dataframe(
-    table_df,
+    _style_numeric_cols(table_df),
     use_container_width=True,
     hide_index=True,
     column_config={
-        "Understock (€)":       st.column_config.NumberColumn(format="€%,.0f", help="Days short of coverage × daily demand × (unit cost + margin)."),
-        "Overstock (€)":        st.column_config.NumberColumn(format="€%,.0f", help="Excess inventory above 1.5× safety stock × unit cost × holding rate × horizon / 365."),
-        "Concentration (€)":    st.column_config.NumberColumn(format="€%,.0f", help="Worst-case sole-source outage: LT × factor × daily demand × (unit cost + margin). Stress scenario."),
-        "LT Volatility (€)":    st.column_config.NumberColumn(format="€%,.0f", help="z × CV(lead time) × LT × daily demand × unit cost × holding rate × horizon / 365. Requires LT history file."),
-        "Margin Sensitivity (€)":  st.column_config.NumberColumn(format="€%,.0f", help="P&L portion of Understock exposure on materials above the margin threshold. Lens — already inside Understock."),
-        "Aging / Expiry (€)":   st.column_config.NumberColumn(format="€%,.0f", help="Inventory value × obsolescence rate. Uses shelf-life data if provided, else aging-bucket method."),
-        "Tariff / Country (€)": st.column_config.NumberColumn(format="€%,.0f", help="Inventory × unit cost × expected tariff change %. Applied to high-risk countries of origin by default."),
-        "Commodity Price (€)":  st.column_config.NumberColumn(format="€%,.0f", help="Horizon demand × unit cost × expected price change %. Replacement cost basis."),
-        "Total IVaR (€)":       st.column_config.NumberColumn(format="€%,.0f", help="Sum of all eight risk dimensions. Total financial exposure for this material."),
+        "Understock (€)":          st.column_config.NumberColumn(help="Days short of coverage × daily demand × (unit cost + margin)."),
+        "Overstock (€)":           st.column_config.NumberColumn(help="Excess inventory above 1.5× safety stock × unit cost × holding rate × horizon / 365."),
+        "Concentration (€)":       st.column_config.NumberColumn(help="Worst-case sole-source outage: LT × factor × daily demand × (unit cost + margin). Stress scenario."),
+        "LT Volatility (€)":       st.column_config.NumberColumn(help="z × CV(lead time) × LT × daily demand × unit cost × holding rate × horizon / 365. Requires LT history file."),
+        "Margin Sensitivity (€)":  st.column_config.NumberColumn(help="P&L portion of Understock exposure on materials above the margin threshold. Lens — already inside Understock."),
+        "Aging / Expiry (€)":      st.column_config.NumberColumn(help="Inventory value × obsolescence rate. Uses shelf-life data if provided, else aging-bucket method."),
+        "Tariff / Country (€)":    st.column_config.NumberColumn(help="Inventory × unit cost × expected tariff change %. Applied to high-risk countries of origin by default."),
+        "Commodity Price (€)":     st.column_config.NumberColumn(help="Horizon demand × unit cost × expected price change %. Replacement cost basis."),
+        "Total IVaR (€)":          st.column_config.NumberColumn(help="Sum of all eight risk dimensions. Total financial exposure for this material."),
     },
 )
 
