@@ -1151,7 +1151,41 @@ wf = pd.DataFrame({
 
 if not wf.empty:
     st.markdown("#### IVaR Decomposition")
-    st.bar_chart(wf, x="Risk Dimension", y="Exposure (€)", horizontal=True)
+    wf_plot = wf.sort_values("Exposure (€)", ascending=True)
+    n = len(wf_plot)
+    max_val = wf_plot["Exposure (€)"].max()
+    colors = [
+        f"rgba(192, 58, 44, {0.30 + 0.65 * (i / max(n - 1, 1))})"
+        for i in range(n)
+    ]
+    drill_fig = go.Figure(go.Bar(
+        x=wf_plot["Exposure (€)"],
+        y=wf_plot["Risk Dimension"],
+        orientation="h",
+        marker=dict(color=colors, line=dict(color="rgba(0,0,0,0.15)", width=0.5)),
+        text=[f"€ {v:,.0f}" for v in wf_plot["Exposure (€)"]],
+        textposition="outside",
+        textfont=dict(size=11),
+        hovertemplate="<b>%{y}</b><br>Exposure: €%{x:,.0f}<extra></extra>",
+    ))
+    drill_fig.update_layout(
+        height=320,
+        margin=dict(l=10, r=80, t=10, b=40),
+        dragmode=False,
+        xaxis=dict(
+            title="Exposure (€)",
+            tickformat=",.0f", tickprefix="€ ",
+            gridcolor="rgba(128,128,128,0.20)",
+            range=[0, max_val * 1.18] if max_val > 0 else None,
+        ),
+        yaxis=dict(title=None, automargin=True),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+    )
+    drill_fig.update_xaxes(fixedrange=True)
+    drill_fig.update_yaxes(fixedrange=True)
+    st.plotly_chart(drill_fig, use_container_width=True)
 else:
     st.success("No material IVaR exposure detected under current parameters.")
 
