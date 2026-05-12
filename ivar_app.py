@@ -26,6 +26,8 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 # =============================================================================
@@ -819,7 +821,45 @@ with st.expander("📊 Portfolio IVaR — by Risk Source", expanded=True):
         .query("`Exposure (€)` > 0")
     )
     if not breakdown.empty:
-        st.bar_chart(breakdown, x="Risk Dimension", y="Exposure (€)", horizontal=True)
+        # Sort ascending so largest bar lands at the top in Plotly horizontal layout
+        breakdown_plot = breakdown.sort_values("Exposure (€)", ascending=True)
+        max_val = breakdown_plot["Exposure (€)"].max()
+
+        # Build a gradient — bars get darker as they get larger (brand red family)
+        n = len(breakdown_plot)
+        colors = [
+            f"rgba(192, 58, 44, {0.30 + 0.65 * (i / max(n - 1, 1))})"
+            for i in range(n)
+        ]
+
+        fig = go.Figure(go.Bar(
+            x=breakdown_plot["Exposure (€)"],
+            y=breakdown_plot["Risk Dimension"],
+            orientation="h",
+            marker=dict(color=colors, line=dict(color="rgba(0,0,0,0.15)", width=0.5)),
+            text=[f"€ {v:,.0f}" for v in breakdown_plot["Exposure (€)"]],
+            textposition="outside",
+            textfont=dict(size=12),
+            hovertemplate="<b>%{y}</b><br>Exposure: €%{x:,.0f}<extra></extra>",
+        ))
+        fig.update_layout(
+            height=380,
+            margin=dict(l=10, r=80, t=20, b=40),
+            xaxis=dict(
+                title="Exposure (€)",
+                tickformat=",.0f",
+                tickprefix="€ ",
+                gridcolor="rgba(128,128,128,0.20)",
+                range=[0, max_val * 1.18],
+            ),
+            yaxis=dict(title=None, automargin=True),
+            plot_bgcolor="rgba(0,0,0,0)",
+            paper_bgcolor="rgba(0,0,0,0)",
+            showlegend=False,
+        )
+        fig.update_xaxes(fixedrange=True)
+        fig.update_yaxes(fixedrange=True)
+        st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("No exposure to display with current data and parameters.")
 
@@ -839,19 +879,104 @@ with st.expander("📊 Risk Matrix — Understock vs Overstock", expanded=True):
         '</div>',
         unsafe_allow_html=True,
     )
-    scatter_df = ivar_df[["material", "understock_ivar", "overstock_ivar", "total_ivar"]].copy()
+    scatter_df = ivar_df[["material", "description", "supplier", "understock_ivar", "overstock_ivar", "total_ivar"]].copy()
     scatter_df = scatter_df.rename(columns={
         "understock_ivar": "Understock IVaR (€)",
         "overstock_ivar":  "Overstock IVaR (€)",
         "total_ivar":      "Total IVaR (€)",
     })
-    st.scatter_chart(
+
+    # Quadrant dividers — set at the median of NON-ZERO values so the cross
+    # lands in a sensible place even when most SKUs are at zero on one axis
+    x_vals = scatter_df["Overstock IVaR (€)"]
+    y_vals = scatter_df["Understock IVaR (€)"]
+    x_med = float(x_vals[x_vals > 0].median()) if (x_vals > 0).any() else 0.0
+    y_med = float(y_vals[y_vals > 0].median()) if (y_vals > 0).any() else 0.0
+
+    fig = px.scatter(
         scatter_df,
         x="Overstock IVaR (€)",
         y="Understock IVaR (€)",
         size="Total IVaR (€)",
         color="Total IVaR (€)",
+        color_continuous_scale="Plasma",
+        size_max=30,
+        hover_data={
+            "material":            True,
+            "description":         True,
+            "supplier":            True,
+            "Total IVaR (€)":      ":,.0f",
+            "Understock IVaR (€)": ":,.0f",
+            "Overstock IVaR (€)":  ":,.0f",
+        },
     )
+
+    # Make dots opaque and bordered so they're actually visible
+    fig.update_traces(
+        marker=dict(
+            line=dict(width=0.8, color="rgba(128,128,128,0.7)"),
+            opacity=0.85,
+        ),
+    )
+
+    # Quadrant divider lines
+    fig.add_hline(y=y_med, line_dash="dot", line_color="rgba(128,128,128,0.50)", line_width=1)
+    fig.add_vline(x=x_med, line_dash="dot", line_color="rgba(128,128,128,0.50)", line_width=1)
+
+    # Quadrant labels — place each in the corresponding corner
+    x_max = float(x_vals.max()) if len(x_vals) else 1.0
+    y_max = float(y_vals.max()) if len(y_vals) else 1.0
+    annotations = [
+        dict(
+            x=x_max * 0.97, y=y_max * 0.97, xref="x", yref="y",
+            text="<b>Both</b><br><span style='font-size:10px;color:#999'>Critical</span>",
+            showarrow=False, font=dict(size=12, color="#C03A2C"),
+            align="right", xanchor="right", yanchor="top",
+        ),
+        dict(
+            x=x_med * 0.05 if x_med > 0 else x_max * 0.02, y=y_max * 0.97,
+            xref="x", yref="y",
+            text="<b>Production at risk</b><br><span style='font-size:10px;color:#999'>Understock dominates</span>",
+            showarrow=False, font=dict(size=12, color="#6A1B9A"),
+            align="left", xanchor="left", yanchor="top",
+        ),
+        dict(
+            x=x_max * 0.97, y=y_med * 0.05 if y_med > 0 else y_max * 0.02,
+            xref="x", yref="y",
+            text="<b>Cash trapped</b><br><span style='font-size:10px;color:#999'>Overstock dominates</span>",
+            showarrow=False, font=dict(size=12, color="#1565C0"),
+            align="right", xanchor="right", yanchor="bottom",
+        ),
+        dict(
+            x=x_med * 0.05 if x_med > 0 else x_max * 0.02,
+            y=y_med * 0.05 if y_med > 0 else y_max * 0.02,
+            xref="x", yref="y",
+            text="<b>Controlled</b><br><span style='font-size:10px;color:#999'>Low on both axes</span>",
+            showarrow=False, font=dict(size=12, color="#2E7D32"),
+            align="left", xanchor="left", yanchor="bottom",
+        ),
+    ]
+
+    fig.update_layout(
+        height=520,
+        margin=dict(l=10, r=10, t=20, b=40),
+        annotations=annotations,
+        xaxis=dict(
+            tickformat=",.0f", tickprefix="€ ",
+            gridcolor="rgba(128,128,128,0.20)", zerolinecolor="rgba(128,128,128,0.35)",
+        ),
+        yaxis=dict(
+            tickformat=",.0f", tickprefix="€ ",
+            gridcolor="rgba(128,128,128,0.20)", zerolinecolor="rgba(128,128,128,0.35)",
+        ),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        coloraxis_colorbar=dict(
+            title=dict(text="Total IVaR (€)", side="right"),
+            tickformat=",.0f", tickprefix="€ ",
+        ),
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
 
