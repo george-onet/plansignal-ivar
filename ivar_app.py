@@ -879,7 +879,60 @@ with st.expander("📊 Risk Matrix — Understock vs Overstock", expanded=True):
         '</div>',
         unsafe_allow_html=True,
     )
-    scatter_df = ivar_df[["material", "description", "supplier", "understock_ivar", "overstock_ivar", "total_ivar"]].copy()
+# Pull all 6 additive dimensions so the hover can show a non-zero breakdown
+    scatter_df = ivar_df[[
+        "material", "description", "supplier",
+        "understock_ivar", "overstock_ivar", "lt_volatility_ivar",
+        "aging_ivar", "tariff_ivar", "commodity_ivar",
+        "total_ivar",
+    ]].copy()
+
+    # Pretty labels for the dimensions that appear in the hover breakdown
+    _hover_dim_labels = {
+        "understock_ivar":     "Understock",
+        "overstock_ivar":      "Overstock",
+        "lt_volatility_ivar":  "LT Volatility",
+        "aging_ivar":          "Aging / Expiry",
+        "tariff_ivar":         "Tariff / Country",
+        "commodity_ivar":      "Commodity Price",
+    }
+
+    def _fmt_eur_compact(v: float) -> str:
+        """Compact EUR for hover: €12.28M / €330k / €450."""
+        if v >= 1_000_000:
+            return f"€{v/1_000_000:.2f}M"
+        if v >= 1_000:
+            return f"€{v/1_000:.0f}k"
+        return f"€{v:.0f}"
+
+    def _build_hover_html(row: pd.Series) -> str:
+        # Main driver = highest non-zero additive dimension
+        dim_values = {label: row[col] for col, label in _hover_dim_labels.items() if row[col] > 0}
+        if dim_values:
+            top_label, top_value = max(dim_values.items(), key=lambda x: x[1])
+            total = row["total_ivar"]
+            pct = (top_value / total * 100) if total > 0 else 0
+            main_driver_line = f"<b>Main driver:</b> {top_label} ({pct:.0f}%)"
+        else:
+            main_driver_line = "<b>Main driver:</b> —"
+
+        # Breakdown — only non-zero dimensions, sorted descending
+        breakdown_rows = sorted(dim_values.items(), key=lambda x: x[1], reverse=True)
+        breakdown_lines = "".join(
+            f"<br>&nbsp;&nbsp;• {label}: {_fmt_eur_compact(v)}"
+            for label, v in breakdown_rows
+        )
+
+        return (
+            f"<b>{row['material']}</b> — {row['description']}<br>"
+            f"<i>{row['supplier']}</i><br>"
+            f"<b>Total IVaR:</b> {_fmt_eur_compact(row['total_ivar'])}<br>"
+            f"{main_driver_line}"
+            f"{breakdown_lines}"
+            "<extra></extra>"
+        )
+
+    scatter_df["__hover"] = scatter_df.apply(_build_hover_html, axis=1)
     scatter_df = scatter_df.rename(columns={
         "understock_ivar": "Understock IVaR (€)",
         "overstock_ivar":  "Overstock IVaR (€)",
@@ -901,56 +954,45 @@ with st.expander("📊 Risk Matrix — Understock vs Overstock", expanded=True):
         color="Total IVaR (€)",
         color_continuous_scale="Plasma",
         size_max=30,
-        hover_data={
-            "material":            True,
-            "description":         True,
-            "supplier":            True,
-            "Total IVaR (€)":      ":,.0f",
-            "Understock IVaR (€)": ":,.0f",
-            "Overstock IVaR (€)":  ":,.0f",
-        },
+        custom_data=["__hover"],
     )
 
-    # Make dots opaque and bordered so they're actually visible
+    # Apply the custom rich hover and dot styling
     fig.update_traces(
         marker=dict(
             line=dict(width=0.8, color="rgba(128,128,128,0.7)"),
             opacity=0.85,
         ),
+        hovertemplate="%{customdata[0]}",
     )
 
-    # Quadrant divider lines
+    # Quadrant divider lines (stay in data coordinates — they're anchored to the medians)
     fig.add_hline(y=y_med, line_dash="dot", line_color="rgba(128,128,128,0.50)", line_width=1)
     fig.add_vline(x=x_med, line_dash="dot", line_color="rgba(128,128,128,0.50)", line_width=1)
 
-    # Quadrant labels — place each in the corresponding corner
-    x_max = float(x_vals.max()) if len(x_vals) else 1.0
-    y_max = float(y_vals.max()) if len(y_vals) else 1.0
+    # Quadrant labels — paper-anchored (xref/yref = "paper") so they stay in
+    # the chart corners during zoom and pan. 0,0 = bottom-left; 1,1 = top-right.
     annotations = [
         dict(
-            x=x_max * 0.97, y=y_max * 0.97, xref="x", yref="y",
+            x=0.99, y=0.99, xref="paper", yref="paper",
             text="<b>Both</b><br><span style='font-size:10px;color:#999'>Critical</span>",
             showarrow=False, font=dict(size=12, color="#C03A2C"),
             align="right", xanchor="right", yanchor="top",
         ),
         dict(
-            x=x_med * 0.05 if x_med > 0 else x_max * 0.02, y=y_max * 0.97,
-            xref="x", yref="y",
+            x=0.01, y=0.99, xref="paper", yref="paper",
             text="<b>Production at risk</b><br><span style='font-size:10px;color:#999'>Understock dominates</span>",
             showarrow=False, font=dict(size=12, color="#6A1B9A"),
             align="left", xanchor="left", yanchor="top",
         ),
         dict(
-            x=x_max * 0.97, y=y_med * 0.05 if y_med > 0 else y_max * 0.02,
-            xref="x", yref="y",
+            x=0.99, y=0.04, xref="paper", yref="paper",
             text="<b>Cash trapped</b><br><span style='font-size:10px;color:#999'>Overstock dominates</span>",
             showarrow=False, font=dict(size=12, color="#1565C0"),
             align="right", xanchor="right", yanchor="bottom",
         ),
         dict(
-            x=x_med * 0.05 if x_med > 0 else x_max * 0.02,
-            y=y_med * 0.05 if y_med > 0 else y_max * 0.02,
-            xref="x", yref="y",
+            x=0.01, y=0.04, xref="paper", yref="paper",
             text="<b>Controlled</b><br><span style='font-size:10px;color:#999'>Low on both axes</span>",
             showarrow=False, font=dict(size=12, color="#2E7D32"),
             align="left", xanchor="left", yanchor="bottom",
@@ -974,6 +1016,11 @@ with st.expander("📊 Risk Matrix — Understock vs Overstock", expanded=True):
         coloraxis_colorbar=dict(
             title=dict(text="Total IVaR (€)", side="right"),
             tickformat=",.0f", tickprefix="€ ",
+        ),
+        hoverlabel=dict(
+            bgcolor="white",
+            bordercolor="rgba(128,128,128,0.4)",
+            font=dict(size=12, color="#222"),
         ),
     )
     st.plotly_chart(fig, use_container_width=True)
