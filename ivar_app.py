@@ -130,6 +130,7 @@ class IVaRParams:
     sole_source_lt_factor: float = 2.0    # worst-case outage = LT × this
     tariff_change_pct:     float = 10.0   # global default; overridable per material
     obsolescence_days:     int   = 90     # aging kicks in above this threshold
+    inventory_target_eur:  float = 0.0    # Finance-set ceiling; 0 = auto-default to current portfolio value
 
 
 # =============================================================================
@@ -525,7 +526,15 @@ with st.sidebar:
         min_value=30, max_value=180, value=90, step=15,
         help="Used only when no shelf-life data is available. Aging IVaR activates above this threshold.",
     )
-
+    st.subheader("Finance Target")
+    inventory_target_eur = st.number_input(
+        "Inventory target (€)",
+        min_value=0.0,
+        value=0.0,
+        step=100_000.0,
+        format="%.0f",
+        help="Finance-set inventory value ceiling. Used to compute Gap to Target. Set to 0 to auto-default to current portfolio value.",
+    )
     params = IVaRParams(
         holding_cost_rate     = holding_pct / 100,
         horizon_days          = horizon_days,
@@ -533,6 +542,7 @@ with st.sidebar:
         sole_source_lt_factor = sole_source_lt_factor,
         tariff_change_pct     = tariff_change_pct,
         obsolescence_days     = obsolescence_days,
+        inventory_target_eur  = inventory_target_eur,
     )
 
     st.markdown("---")
