@@ -1334,7 +1334,12 @@ table_df.rename(columns={
     "description": "Description",
     "supplier":    "Supplier",
 }, inplace=True)
-
+# % of Total IVaR — uses full portfolio denominator, not just the displayed top_n
+portfolio_total_ivar = ivar_df["total_ivar"].sum()
+if portfolio_total_ivar > 0:
+    table_df["% of Total"] = (table_df["Total IVaR (€)"] / portfolio_total_ivar * 100).round(1)
+else:
+    table_df["% of Total"] = 0.0
 for c in [v for v in RISK_LABELS.values() if v in table_df.columns]:
     table_df[c] = table_df[c].round(0)
 
@@ -1358,6 +1363,8 @@ def _style_numeric_cols(df: pd.DataFrame):
             )
     # EUR formatting applied via Styler so it survives alongside the gradient.
     fmt = {c: "€{:,.0f}" for c in _numeric_cols}
+    if "% of Total" in df.columns:
+        fmt["% of Total"] = "{:.1f}%"
     styler = styler.format(fmt)
     return styler
 
@@ -1375,6 +1382,7 @@ st.dataframe(
         "Tariff / Country (€)":    st.column_config.NumberColumn(help="Inventory × unit cost × expected tariff change %. Applied to high-risk countries of origin by default."),
         "Commodity Price (€)":     st.column_config.NumberColumn(help="Horizon demand × unit cost × expected price change %. Replacement cost basis."),
         "Total IVaR (€)":          st.column_config.NumberColumn(help="Sum of the six additive IVaR dimensions. Concentration and Margin Sensitivity are shown as lenses and are not included in Total IVaR."),
+        "% of Total":              st.column_config.NumberColumn(help="This material's Total IVaR as a percentage of the full portfolio Total IVaR (sum across all 500 materials, not just those displayed)."),
     },
 )
 
