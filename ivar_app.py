@@ -36,6 +36,8 @@ import streamlit as st
 
 APP_VERSION = "1.0"
 LOG_FILE    = "ivar_usage_log.csv"
+TRUE_FLAG_VALUES = {"Y", "YES", "TRUE", "1", "X"}
+FALSE_FLAG_VALUES = {"N", "NO", "FALSE", "0", ""}
 
 # Standard aging obsolescence rates by days-on-hand bucket
 AGING_BUCKETS = [
@@ -162,6 +164,32 @@ def _safe(val, default: float = 0.0) -> float:
     except (TypeError, ValueError):
         return default
 
+def normalize_bool_flag(value) -> Optional[bool]:
+    """
+    Normalize ERP-style boolean flags.
+
+    True examples:
+    Y, YES, TRUE, 1, X
+
+    False examples:
+    N, NO, FALSE, 0, blank
+
+    Unknown values return None so they can be flagged in the Data Quality panel.
+    """
+    raw = str(value).strip().upper()
+
+    if raw in TRUE_FLAG_VALUES:
+        return True
+
+    if raw in FALSE_FLAG_VALUES or raw in {"NAN", "NONE", "NULL"}:
+        return False
+
+    return None
+
+
+def is_true_flag(value) -> bool:
+    """Safe boolean check used by risk logic."""
+    return normalize_bool_flag(value) is True
 
 def _aging_rate(days_on_hand: float) -> float:
     for threshold, rate in AGING_BUCKETS:
@@ -222,7 +250,7 @@ def _overstock(row: pd.Series, p: IVaRParams) -> float:
 
 def _concentration(row: pd.Series, p: IVaRParams) -> float:
     """Worst-case disruption cost for sole-sourced materials (stress scenario, not EV)."""
-    if str(row.get("sole_source", "N")).strip().upper() not in ("Y", "YES", "TRUE", "1"):
+    if not is_true_flag(row.get("sole_source", "N")):
         return 0.0
     demand = _safe(row.get("avg_daily_demand"))
     lt     = _safe(row.get("lead_time_days"))
@@ -359,21 +387,21 @@ def compute_ivar(df: pd.DataFrame, params: IVaRParams, lt_cv_map: dict) -> pd.Da
 
 ACTION_CATEGORIES = {
     "drawdown": {
-        "label":    "Drawdown candidates",
+        "label":    "Trapped Working Capital",
         "color":    "#C03A2C",  # red — highest-priority lever to close gap
         "emoji":    "🟥",
         "decision": "Procurement + Finance: write-down, repurpose, divest, or hold?",
         "rank":     1,
     },
     "writeoff": {
-        "label":    "Forced write-off",
+        "label":    "Shelf-life risk",
         "color":    "#E67E22",  # orange — P&L timing decision
         "emoji":    "🟧",
         "decision": "Procurement + Finance: when to book the loss, and how much is recoverable?",
         "rank":     2,
     },
     "structural": {
-        "label":    "Structural commitments",
+        "label":    "Single-source liability",
         "color":    "#F1C40F",  # yellow — informational, not in-period lever
         "emoji":    "🟨",
         "decision": "Procurement + Finance: dual-source investment, contingency reserve, or risk acceptance?",
@@ -397,7 +425,7 @@ def categorize_action(row: pd.Series, params: IVaRParams, materiality_eur: float
     lt          = _safe(row.get("lead_time_days"))
     shelf_life  = _safe(row.get("shelf_life_days"))
     days_oh     = _safe(row.get("days_on_hand"))
-    sole_source = str(row.get("sole_source", "N")).strip().upper() in ("Y", "YES", "TRUE", "1")
+    sole_source = is_true_flag(row.get("sole_source", "N"))
     inventory_value = inventory * cost
 
     # ── 1. FORCED WRITE-OFF (highest precedence) ──
@@ -826,7 +854,7 @@ total_margin_sens   = float(ivar_df["margin_critical_ivar"].sum())
 # Portfolio metadata
 total_materials   = len(ivar_df)
 high_risk_count   = int((ivar_df["total_ivar"] >= ivar_df["total_ivar"].quantile(0.75)).sum())
-sole_source_mask  = ivar_df["sole_source"].astype(str).str.strip().str.upper().isin(["Y", "YES", "TRUE", "1"])
+sole_source_mask = ivar_df["sole_source"].apply(is_true_flag)
 sole_source_count = int(sole_source_mask.sum())
 
 # Portfolio inventory value — Finance KPI denominator
@@ -895,6 +923,82 @@ with st.container(border=True):
             "—",
             help="Set a Finance target in the sidebar to see Gap to Target.",
         )
+
+# ─── ACTION LIST ───
+with st.container(border=True):
+    st.markdown("### 📋 Action List")
+    st.caption(
+        "SKUs surfaced for joint Procurement+Finance decisions. "
+        "Each SKU appears in **one** category — the most pressing decision required. "
+        "Ranked by inventory value within each band."
+    )
+
+    items_per_band = st.slider(
+        "Items per band",
+        min_value=3, max_value=10, value=3, step=1,
+        help="How many SKUs to show in each action category. Default 3 (most pressing only).",
+        key="action_items_per_band",
+    )
+
+    # Action list helper — render a single category block
+    def _render_action_band(category_key: str, ivar_df_with_actions: pd.DataFrame, n: int) -> None:
+        cfg = ACTION_CATEGORIES[category_key]
+        band_df = (
+            ivar_df_with_actions[ivar_df_with_actions["action_category"] == category_key]
+            .sort_values("action_value_eur", ascending=False)
+            .head(n)
+        )
+
+        total_in_band = int((ivar_df_with_actions["action_category"] == category_key).sum())
+        eur_in_band = float(
+            ivar_df_with_actions.loc[ivar_df_with_actions["action_category"] == category_key, "action_value_eur"].sum()
+        )
+
+        st.markdown(
+            f"<div style='margin-top:1rem;'>"
+            f"<span style='font-size:1.05rem;font-weight:600;color:{cfg['color']};'>{cfg['emoji']} {cfg['label']}</span>"
+            f"&nbsp;&nbsp;<span style='color:#888;font-size:0.85rem;'>({total_in_band} SKU{'s' if total_in_band != 1 else ''} flagged · "
+            f"€ {eur_in_band:,.0f} total)</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"<div style='color:#666;font-size:0.85rem;font-style:italic;margin-bottom:0.5rem;'>"
+            f"{cfg['decision']}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        if band_df.empty:
+            st.markdown(
+                "<div style='color:#888;font-size:0.85rem;padding:0.5rem 1rem;'>"
+                "No SKUs flagged — clean exposure in this category."
+                "</div>",
+                unsafe_allow_html=True,
+            )
+            return
+
+        # Build a compact display table for this band
+        display = pd.DataFrame({
+            "Material":      band_df["material"].astype(str),
+            "Description":   band_df.get("description", pd.Series([""] * len(band_df))).astype(str),
+            "Supplier":      band_df.get("supplier",    pd.Series([""] * len(band_df))).astype(str),
+            "Inventory (€)": band_df["action_value_eur"].round(0),
+            "Trigger":       band_df["action_trigger"].astype(str),
+        })
+        st.dataframe(
+            display.style.format({"Inventory (€)": "€{:,.0f}"}),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Inventory (€)": st.column_config.NumberColumn(help="Inventory book value: inventory_on_hand × unit_cost_eur"),
+                "Trigger":       st.column_config.TextColumn(width="large"),
+            },
+        )
+
+    # Render the three bands in precedence order (rank: drawdown=1, writeoff=2, structural=3)
+    for cat_key in sorted(ACTION_CATEGORIES.keys(), key=lambda k: ACTION_CATEGORIES[k]["rank"]):
+        _render_action_band(cat_key, ivar_df, items_per_band)
 
 # ─── EXPECTED LOSS (TOTAL IVaR) ───
 with st.container(border=True):
@@ -1270,7 +1374,7 @@ st.dataframe(
         "Aging / Expiry (€)":      st.column_config.NumberColumn(help="Inventory value × obsolescence rate. Uses shelf-life data if provided, else aging-bucket method."),
         "Tariff / Country (€)":    st.column_config.NumberColumn(help="Inventory × unit cost × expected tariff change %. Applied to high-risk countries of origin by default."),
         "Commodity Price (€)":     st.column_config.NumberColumn(help="Horizon demand × unit cost × expected price change %. Replacement cost basis."),
-        "Total IVaR (€)":          st.column_config.NumberColumn(help="Sum of all eight risk dimensions. Total financial exposure for this material."),
+        "Total IVaR (€)":          st.column_config.NumberColumn(help="Sum of the six additive IVaR dimensions. Concentration and Margin Sensitivity are shown as lenses and are not included in Total IVaR."),
     },
 )
 
