@@ -353,6 +353,91 @@ def compute_ivar(df: pd.DataFrame, params: IVaRParams, lt_cv_map: dict) -> pd.Da
     work["total_ivar"]           = work[RISK_COLS_ADDITIVE].sum(axis=1)
     return work.sort_values("total_ivar", ascending=False)
 
+# =============================================================================
+# ACTION LIST — categorize SKUs by joint Procurement+Finance decision type
+# =============================================================================
+
+ACTION_CATEGORIES = {
+    "drawdown": {
+        "label":    "Drawdown candidates",
+        "color":    "#C03A2C",  # red — highest-priority lever to close gap
+        "emoji":    "🟥",
+        "decision": "Procurement + Finance: write-down, repurpose, divest, or hold?",
+        "rank":     1,
+    },
+    "writeoff": {
+        "label":    "Forced write-off",
+        "color":    "#E67E22",  # orange — P&L timing decision
+        "emoji":    "🟧",
+        "decision": "Procurement + Finance: when to book the loss, and how much is recoverable?",
+        "rank":     2,
+    },
+    "structural": {
+        "label":    "Structural commitments",
+        "color":    "#F1C40F",  # yellow — informational, not in-period lever
+        "emoji":    "🟨",
+        "decision": "Procurement + Finance: dual-source investment, contingency reserve, or risk acceptance?",
+        "rank":     3,
+    },
+}
+
+
+def categorize_action(row: pd.Series, params: IVaRParams, materiality_eur: float = 10_000.0) -> tuple[Optional[str], str]:
+    """
+    Assign ONE action category per SKU, based on the most pressing joint
+    Procurement+Finance decision. Returns (category_key, trigger_reason).
+    Precedence: writeoff > drawdown > structural. Higher-precedence categories
+    absorb SKUs that would otherwise also qualify for lower bands — keeps the
+    action list clean (single primary category per SKU, per Decision 1).
+    Returns (None, "") for SKUs that don't trigger any band.
+    """
+    inventory   = _safe(row.get("inventory_on_hand"))
+    cost        = _safe(row.get("unit_cost_eur"), 1.0)
+    demand      = _safe(row.get("avg_daily_demand"))
+    lt          = _safe(row.get("lead_time_days"))
+    shelf_life  = _safe(row.get("shelf_life_days"))
+    days_oh     = _safe(row.get("days_on_hand"))
+    sole_source = str(row.get("sole_source", "N")).strip().upper() in ("Y", "YES", "TRUE", "1")
+    inventory_value = inventory * cost
+
+    # ── 1. FORCED WRITE-OFF (highest precedence) ──
+    if shelf_life > 0 and days_oh > shelf_life:
+        return "writeoff", f"Past expiry ({days_oh - shelf_life:.0f} days over shelf life)"
+    if shelf_life > 0 and (shelf_life - days_oh) <= 30 and inventory_value >= materiality_eur:
+        return "writeoff", f"{shelf_life - days_oh:.0f} days of shelf life remaining"
+
+    # ── 2. DRAWDOWN CANDIDATES ──
+    if demand > 0 and lt > 0:
+        coverage_days = inventory / demand
+        if coverage_days >= 2 * lt and inventory_value >= materiality_eur:
+            return "drawdown", f"{coverage_days:.0f} days coverage vs {lt:.0f}-day lead time"
+
+    if demand == 0 and inventory_value >= materiality_eur:
+        return "drawdown", f"€{inventory_value:,.0f} held with no recorded demand"
+
+    # ── 3. STRUCTURAL COMMITMENTS (lowest precedence) ──
+    if sole_source and lt >= 60 and inventory_value >= materiality_eur:
+        return "structural", f"Sole-source, {lt:.0f}-day lead time, €{inventory_value:,.0f} committed"
+
+    return None, ""
+
+
+def build_action_list(ivar_df: pd.DataFrame, params: IVaRParams) -> pd.DataFrame:
+    """
+    Add three columns to the IVaR-enriched DataFrame:
+    - action_category: 'drawdown' | 'writeoff' | 'structural' | None
+    - action_trigger: human-readable reason this SKU was flagged
+    - action_value_eur: inventory book value (the EUR figure both functions discuss)
+    """
+    work = ivar_df.copy()
+    cats_triggers = work.apply(lambda r: categorize_action(r, params), axis=1)
+    work["action_category"] = cats_triggers.apply(lambda t: t[0])
+    work["action_trigger"]  = cats_triggers.apply(lambda t: t[1])
+    work["action_value_eur"] = (
+        pd.to_numeric(work["inventory_on_hand"], errors="coerce").fillna(0)
+        * pd.to_numeric(work["unit_cost_eur"], errors="coerce").fillna(0)
+    )
+    return work
 
 # =============================================================================
 # TEMPLATE
@@ -719,7 +804,7 @@ if lt_history_uploaded is not None:
 # =============================================================================
 
 ivar_df = compute_ivar(df, params, lt_cv_map)
-
+ivar_df = build_action_list(ivar_df, params)
 
 # =============================================================================
 # PORTFOLIO SUMMARY
@@ -743,6 +828,73 @@ total_materials   = len(ivar_df)
 high_risk_count   = int((ivar_df["total_ivar"] >= ivar_df["total_ivar"].quantile(0.75)).sum())
 sole_source_mask  = ivar_df["sole_source"].astype(str).str.strip().str.upper().isin(["Y", "YES", "TRUE", "1"])
 sole_source_count = int(sole_source_mask.sum())
+
+# Portfolio inventory value — Finance KPI denominator
+total_inventory_value = float(
+    (pd.to_numeric(ivar_df["inventory_on_hand"], errors="coerce").fillna(0)
+     * pd.to_numeric(ivar_df["unit_cost_eur"], errors="coerce").fillna(0)).sum()
+)
+# Resolve target: 0 = auto-default to current portfolio value (neutral starting point)
+effective_target = params.inventory_target_eur if params.inventory_target_eur > 0 else total_inventory_value
+gap_to_target = total_inventory_value - effective_target  # positive = over-target (red); negative = under (green)
+
+# ─── HEADLINE: CURRENT INVENTORY VALUE vs TARGET ───
+with st.container(border=True):
+    st.markdown("### Current Inventory Value vs. Target")
+    if params.inventory_target_eur > 0:
+        st.caption(
+            f"{total_materials} materials · "
+            f"Target set by Finance: € {params.inventory_target_eur:,.0f}"
+        )
+    else:
+        st.caption(
+            f"{total_materials} materials · "
+            "No Finance target set — defaulting to current portfolio value. "
+            "Enter a target in the sidebar to see Gap to Target."
+        )
+
+    h1, h2, h3 = st.columns(3)
+    h1.metric(
+        "Current inventory value",
+        f"€ {total_inventory_value:,.0f}",
+        help="Sum of (inventory on hand × unit cost) across all materials in the portfolio. Matches the Finance balance-sheet view of inventory.",
+    )
+    h2.metric(
+        "Finance target",
+        f"€ {effective_target:,.0f}",
+        help="Inventory ceiling set in the sidebar. Defaults to current portfolio value when no target is entered.",
+    )
+
+    # Gap to target — labeled framing per Decision 2
+    if params.inventory_target_eur > 0:
+        if gap_to_target > 0:
+            h3.metric(
+                "Gap to target",
+                f"Over by € {gap_to_target:,.0f}",
+                delta=f"{(gap_to_target / effective_target * 100):.1f}% above target",
+                delta_color="inverse",
+                help="Current inventory value exceeds the Finance target. Use the Action List below to identify drawdown candidates.",
+            )
+        elif gap_to_target < 0:
+            h3.metric(
+                "Gap to target",
+                f"Under by € {abs(gap_to_target):,.0f}",
+                delta=f"{(abs(gap_to_target) / effective_target * 100):.1f}% below target",
+                delta_color="normal",
+                help="Current inventory value is below the Finance target. Headroom available.",
+            )
+        else:
+            h3.metric(
+                "Gap to target",
+                "On target",
+                help="Current inventory value matches the Finance target exactly.",
+            )
+    else:
+        h3.metric(
+            "Gap to target",
+            "—",
+            help="Set a Finance target in the sidebar to see Gap to Target.",
+        )
 
 # ─── EXPECTED LOSS (TOTAL IVaR) ───
 with st.container(border=True):
