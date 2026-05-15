@@ -7,7 +7,7 @@
 # Eight risk dimensions, each expressed in EUR:
 #   1. Understock          — lost production / missed sales risk
 #   2. Overstock           — cash trapped / holding cost
-#   3. Concentration       — worst-case single-source disruption scenario
+#   3. Supply Continuity   — worst-case single-source disruption scenario
 #   4. LT Volatility       — safety stock inflation from lead-time variance
 #   5. Margin Sensitivity  — P&L portion of Understock on high-margin materials (lens)
 #   6. Aging / Expiry      — obsolescence / write-off risk
@@ -64,7 +64,7 @@ RISK_COLS_ADDITIVE = [
 ]
 
 # Lens dimensions — surfaced separately, not summed into Total IVaR
-# (Concentration is a stress scenario; Margin Sensitivity is a P&L lens
+# (Supply Continuity is a stress scenario; Margin Sensitivity is a P&L lens
 # on Understock for high-margin SKUs)
 RISK_COLS_LENS = [
     "concentration_ivar",
@@ -77,7 +77,7 @@ RISK_COLS = RISK_COLS_ADDITIVE + RISK_COLS_LENS
 RISK_LABELS = {
     "understock_ivar":      "Understock (€)",
     "overstock_ivar":       "Overstock (€)",
-    "concentration_ivar":   "Concentration (€)",
+    "concentration_ivar":   "Supply Continuity (€)",
     "lt_volatility_ivar":   "LT Volatility (€)",
     "margin_critical_ivar": "Margin Sensitivity (€)",
     "aging_ivar":           "Aging / Expiry (€)",
@@ -133,6 +133,7 @@ class IVaRParams:
     tariff_change_pct:     float = 10.0   # global default; overridable per material
     obsolescence_days:     int   = 90     # aging kicks in above this threshold
     inventory_target_eur:  float = 0.0    # Finance-set ceiling; 0 = auto-default to current portfolio value
+    include_in_transit:    bool  = True   # treat in-transit (buyer's title) as part of effective inventory per dimension rules
 
 
 # =============================================================================
@@ -221,20 +222,59 @@ def _std_cols(df: pd.DataFrame) -> pd.DataFrame:
 # RISK DIMENSION FUNCTIONS  (each returns EUR float)
 # =============================================================================
 
+def _inventory_with_transit(row: pd.Series, p: IVaRParams, ignore_horizon: bool = False) -> float:
+    """
+    Effective inventory in units = on-hand + applicable in-transit (buyer's title).
+    
+    In-transit treatment rules:
+    - If params.include_in_transit is False → in-transit excluded everywhere
+      (Finance view: only on-hand stock counts toward IVaR)
+    - If in_transit_arrival_days > horizon AND ignore_horizon=False →
+      in-transit excluded for this dimension (arrives outside analysis window)
+    - ignore_horizon=True is used by Supply Continuity and Tariff: the stock
+      is on our books from origin under buyer's title regardless of arrival
+      timing, so supplier failure or tariff change exposes it whether it
+      arrives in 30 days or 300
+    
+    Returns units (not EUR). Caller multiplies by unit_cost where needed.
+    """
+    on_hand = _safe(row.get("inventory_on_hand"))
+    if not p.include_in_transit:
+        return on_hand
+    transit = _safe(row.get("in_transit_units"))
+    if transit <= 0:
+        return on_hand
+    if not ignore_horizon:
+        arrival = _safe(row.get("in_transit_arrival_days"))
+        if arrival > p.horizon_days:
+            return on_hand
+    return on_hand + transit
+
 def _understock(row: pd.Series, p: IVaRParams) -> float:
-    """Lost production / missed sales when stock cannot cover the replenishment cycle."""
+    """
+    Inventory exposure from coverage shortfall.
+    
+    When stock is below the level needed to cover lead time, remaining inventory
+    is effectively locked — committed to firm orders/production runs and
+    unavailable for reduction. Exposure scales with shortfall severity:
+    the closer to zero coverage, the larger the locked share.
+    """
     demand = _safe(row.get("avg_daily_demand"))
     if demand <= 0:
         return 0.0
-    inventory = _safe(row.get("inventory_on_hand"))
+    inventory = _inventory_with_transit(row, p)
     lt        = _safe(row.get("lead_time_days"))
     cost      = _safe(row.get("unit_cost_eur"), 1.0)
-    margin    = _safe(row.get("margin_pct")) / 100
-
-    coverage    = inventory / demand
-    days_short  = max(0.0, lt - coverage)
-    units_short = days_short * demand
-    return units_short * cost * (1 + margin)
+    if lt <= 0:
+        return 0.0
+    
+    coverage   = inventory / demand
+    if coverage >= lt:
+        return 0.0   # adequately covered — no inventory locked by shortfall
+    
+    locked_fraction = (lt - coverage) / lt   # 0 at full coverage, 1 at zero coverage
+    inventory_value = inventory * cost
+    return inventory_value * locked_fraction
 
 
 def _overstock(row: pd.Series, p: IVaRParams) -> float:
@@ -249,17 +289,28 @@ def _overstock(row: pd.Series, p: IVaRParams) -> float:
 
 
 def _concentration(row: pd.Series, p: IVaRParams) -> float:
-    """Worst-case disruption cost for sole-sourced materials (stress scenario, not EV)."""
+    """
+    Inventory exposure from sole-source supplier failure (stress scenario).
+    
+    EUR of inventory tied up in sole-sourced materials that is exposed to loss
+    if the supplier fails — stock becomes either stranded (waiting on
+    qualification of an alternative source) or written off (if requalification
+    requires reformulation). Flat full exposure: if you're sole-sourced and
+    supplier fails, the inventory value is the exposure.
+    
+    The sole_source_lt_factor slider governs which materials get flagged into
+    the Action List (longer outage scenarios surface more borderline cases),
+    not the severity per material.
+    """
     if not is_true_flag(row.get("sole_source", "N")):
         return 0.0
-    demand = _safe(row.get("avg_daily_demand"))
-    lt     = _safe(row.get("lead_time_days"))
-    cost   = _safe(row.get("unit_cost_eur"), 1.0)
-    margin = _safe(row.get("margin_pct")) / 100
-
-    outage_days  = lt * p.sole_source_lt_factor
-    units_at_risk = demand * outage_days
-    return units_at_risk * cost * (1 + margin)
+    
+    cost = _safe(row.get("unit_cost_eur"), 1.0)
+    # ignore_horizon=True: in-transit under buyer's title is on our books from
+    # origin, so a supplier failure or contract default exposes it regardless
+    # of when the shipment would have arrived
+    effective_units = _inventory_with_transit(row, p, ignore_horizon=True)
+    return effective_units * cost
 
 
 def _lt_volatility(row: pd.Series, lt_cv_map: dict, p: IVaRParams) -> float:
@@ -279,22 +330,35 @@ def _lt_volatility(row: pd.Series, lt_cv_map: dict, p: IVaRParams) -> float:
 
 
 def _margin_critical(row: pd.Series, p: IVaRParams) -> float:
-    """P&L amplification on high-margin materials with understock exposure."""
+    """
+    Margin-weighted inventory exposure on high-margin materials.
+    
+    Lens on Understock: high-margin materials carry amplified P&L weight per
+    EUR of locked inventory. If understock-locked stock has to be discounted
+    or written off, the margin loss is the additional P&L impact on top of
+    the inventory exposure already captured in Understock.
+    """
     margin = _safe(row.get("margin_pct"))
     if margin < p.margin_critical_pct:
         return 0.0
-
+    
     demand = _safe(row.get("avg_daily_demand"))
     if demand <= 0:
         return 0.0
-
-    inventory   = _safe(row.get("inventory_on_hand"))
-    lt          = _safe(row.get("lead_time_days"))
-    cost        = _safe(row.get("unit_cost_eur"), 1.0)
-    coverage    = inventory / demand
-    days_short  = max(0.0, lt - coverage)
-    units_short = days_short * demand
-    return units_short * cost * (margin / 100)
+    
+    inventory = _inventory_with_transit(row, p)
+    lt        = _safe(row.get("lead_time_days"))
+    cost      = _safe(row.get("unit_cost_eur"), 1.0)
+    if lt <= 0:
+        return 0.0
+    
+    coverage = inventory / demand
+    if coverage >= lt:
+        return 0.0
+    
+    locked_fraction = (lt - coverage) / lt
+    inventory_value = inventory * cost
+    return inventory_value * locked_fraction * (margin / 100)
 
 
 def _aging(row: pd.Series, p: IVaRParams) -> float:
@@ -331,9 +395,12 @@ def _tariff(row: pd.Series, p: IVaRParams) -> float:
     else:
         rate = mat_rate
 
-    inventory = _safe(row.get("inventory_on_hand"))
-    cost      = _safe(row.get("unit_cost_eur"), 1.0)
-    return inventory * cost * (rate / 100)
+    # ignore_horizon=True: tariff exposure applies on arrival regardless of
+    # when stock lands. In-transit at origin under buyer's title is already
+    # exposed to the tariff change because revaluation hits at customs clearance
+    effective_units = _inventory_with_transit(row, p, ignore_horizon=True)
+    cost = _safe(row.get("unit_cost_eur"), 1.0)
+    return effective_units * cost * (rate / 100)
 
 
 def _commodity(row: pd.Series, p: IVaRParams) -> float:
@@ -410,7 +477,7 @@ ACTION_CATEGORIES = {
 }
 
 
-def categorize_action(row: pd.Series, params: IVaRParams, materiality_eur: float = 10_000.0) -> tuple[Optional[str], str]:
+def categorize_action(row: pd.Series, params: IVaRParams, materiality_eur: float = 50_000.0) -> tuple[Optional[str], str]:
     """
     Assign ONE action category per SKU, based on the most pressing joint
     Procurement+Finance decision. Returns (category_key, trigger_reason).
@@ -437,14 +504,14 @@ def categorize_action(row: pd.Series, params: IVaRParams, materiality_eur: float
     # ── 2. DRAWDOWN CANDIDATES ──
     if demand > 0 and lt > 0:
         coverage_days = inventory / demand
-        if coverage_days >= 2 * lt and inventory_value >= materiality_eur:
+        if coverage_days >= 3 * lt and inventory_value >= materiality_eur:
             return "drawdown", f"{coverage_days:.0f} days coverage vs {lt:.0f}-day lead time"
 
     if demand == 0 and inventory_value >= materiality_eur:
         return "drawdown", f"€{inventory_value:,.0f} held with no recorded demand"
 
     # ── 3. STRUCTURAL COMMITMENTS (lowest precedence) ──
-    if sole_source and lt >= 60 and inventory_value >= materiality_eur:
+    if sole_source and lt >= 60 and inventory_value >= materiality_eur * 2:
         return "structural", f"Sole-source, {lt:.0f}-day lead time, €{inventory_value:,.0f} committed"
 
     return None, ""
@@ -505,7 +572,7 @@ def build_excel_export(ivar_df: pd.DataFrame, params: IVaRParams) -> bytes:
         "unit_cost_eur":         "Unit Cost (€)",
         "understock_ivar":       "Understock IVaR (€)",
         "overstock_ivar":        "Overstock IVaR (€)",
-        "concentration_ivar":    "Concentration IVaR (€)",
+        "concentration_ivar":    "Supply Continuity (€)",
         "lt_volatility_ivar":    "LT Volatility IVaR (€)",
         "margin_critical_ivar":  "Margin Sensitivity IVaR (€)",
         "aging_ivar":            "Aging / Expiry IVaR (€)",
@@ -612,17 +679,19 @@ with st.sidebar:
         help="Materials above this gross margin % carry amplified P&L risk on stockouts.",
     )
 
-    st.subheader("Concentration Risk")
+    st.subheader("Supply Continuity Risk")
     sole_source_lt_factor = st.slider(
         "Worst-case outage (× lead time)",
         min_value=1.0, max_value=5.0, value=2.0, step=0.5,
         help=(
-            "Assumed disruption length as a multiple of normal lead time. "
-            "2× means 'supplier down for twice the normal replenishment cycle'. "
-            "This is a stress scenario, not a probability-weighted expected value."
+            "Outage assumption used for Action List flagging severity — longer "
+            "outage scenarios surface more borderline sole-source materials into "
+            "the 'Single-source liability' band. Note: Supply Continuity exposure "
+            "itself is flat full inventory value at risk per sole-sourced material "
+            "(not scaled by this slider) — the slider controls which materials get "
+            "flagged, not the per-material number."
         ),
-    )
-
+    )   
     st.subheader("Tariff Exposure")
     tariff_change_pct = st.slider(
         "Expected tariff change (%)",
@@ -648,6 +717,22 @@ with st.sidebar:
         format="%.0f",
         help="Finance-set inventory value ceiling. Used to compute Gap to Target. Set to 0 to auto-default to current portfolio value.",
     )
+
+    st.subheader("In-Transit Treatment")
+    include_in_transit = st.toggle(
+        "Include in-transit inventory in IVaR",
+        value=True,
+        help=(
+            "When ON: in-transit stock under buyer's title (FCA, EXW, FOB, CIF, "
+            "CFR, CIP) is counted as effective inventory per dimension rules. "
+            "Understock, Margin Sensitivity → counted if arriving within horizon. "
+            "Supply Continuity, Tariff → counted regardless of arrival timing. "
+            "Overstock, Aging, Commodity → never counted (off balance sheet or not aging). "
+            "When OFF: only on-hand stock is used everywhere — useful for Finance "
+            "to see IVaR as it appears on the balance sheet today."
+        ),
+    )
+
     params = IVaRParams(
         holding_cost_rate     = holding_pct / 100,
         horizon_days          = horizon_days,
@@ -656,6 +741,7 @@ with st.sidebar:
         tariff_change_pct     = tariff_change_pct,
         obsolescence_days     = obsolescence_days,
         inventory_target_eur  = inventory_target_eur,
+        include_in_transit    = include_in_transit,
     )
 
     st.markdown("---")
@@ -692,10 +778,10 @@ else:
 
 st.markdown(
     '<div style="font-size: 1.05rem; color: #555; margin-top: -8px;">'
-    'Inventory financial exposure, quantified per material.'
+    'Inventory carrying cost and value at risk — quantified per material.'
     '</div>'
     '<div style="font-size: 0.95rem; color: #777; font-style: italic; margin-top: 2px; margin-bottom: 8px;">'
-    'One number Procurement and Finance can both stand behind.'
+    'Two sides of the same EBITDA coin: where to reduce inventory, and where reductions would create new risk.'
     '</div>',
     unsafe_allow_html=True,
 )
@@ -723,7 +809,7 @@ Each dimension surfaces a different way inventory can cost the business — and 
 **Total IVaR sums the six additive dimensions** (Understock, Overstock, LT Volatility, Aging, Tariff, Commodity) — these represent expected loss exposures.
 
 Two further dimensions are surfaced as **lenses, not summands**:
-- **Concentration** is a stress test (worst-case sole-source outage), not a probability-weighted loss
+- **Supply Continuity** is a stress test (worst-case sole-source outage), not a probability-weighted loss
 - **Margin Sensitivity** highlights the P&L portion of Understock on high-margin materials (already inside Understock, called out for visibility)
 
 This separation keeps Total IVaR comparable to financial VaR concepts: expected loss over a horizon, with stress and amplification surfaced alongside.
@@ -732,7 +818,7 @@ This separation keeps Total IVaR comparable to financial VaR concepts: expected 
 
 **The more material data you provide, the more dimensions IVaR quantifies.**
 
-4 dimensions compute from any portfolio: **Understock**, **Overstock**, **Concentration**, **LT Volatility**.
+4 dimensions compute from any portfolio: **Understock**, **Overstock**, **Supply Continuity**, **LT Volatility**.
 
 4 more unlock as you add data:
 - **Margin Sensitivity exposure** — needs gross margin per material
@@ -748,7 +834,7 @@ Each dimension is independently auditable. **Hover any column header in the tabl
 |---|---|---|
 | **Understock** | Lost production / missed sales before next replenishment arrives | Days short × daily demand × (unit cost + margin) |
 | **Overstock** | Capital cost of inventory held above 1.5 × safety stock | Excess units × unit cost × holding rate × horizon / 365 |
-| **Concentration** *(lens)* | *Stress scenario* — full outage of sole-source supplier lasting LT × factor days | Outage days × daily demand × (unit cost + margin) |
+| **Supply Continuity** *(lens)* | *Stress scenario* — full outage of sole-source supplier lasting LT × factor days | Outage days × daily demand × (unit cost + margin) |
 | **LT Volatility** | Extra safety stock required to absorb observed lead-time variance | z (1.65) × CV(LT) × LT × daily demand × unit cost × holding rate × horizon / 365 |
 | **Margin Sensitivity** *(lens)* | P&L portion of Understock exposure on high-margin materials | Shortfall units × unit cost × margin % (high-margin materials only) |
 | **Aging / Expiry** | Write-off risk from inventory nearing shelf-life expiry or aged beyond threshold | Inventory value × obsolescence rate (shelf-life or aging-bucket method) |
@@ -1002,18 +1088,23 @@ with st.container(border=True):
 
 # ─── EXPECTED LOSS (TOTAL IVaR) ───
 with st.container(border=True):
-    st.markdown("### Expected Loss — Total IVaR")
+    st.markdown("### Total IVaR — EBITDA at Risk")
     st.caption(
         f"{total_materials} materials · "
         f"{horizon_days}-day forward horizon · "
         f"{holding_pct}% annual holding cost · "
-        f"sum of six additive dimensions"
+        f"sum of six additive dimensions — the EBITDA at risk in inventory over the horizon"
     )
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(
         "Total IVaR", f"€ {total_ivar:,.0f}",
-        help="Sum of the six additive expected-loss dimensions: Understock, Overstock, LT Volatility, Aging, Tariff, Commodity.",
+        help=(
+            "EBITDA at risk over the forward horizon — sum of six additive dimensions: "
+            "Overstock (carrying cost on excess), LT Volatility (extra safety stock cost), "
+            "Aging (write-off risk), Tariff (revaluation), Commodity (forward margin), "
+            "Understock (locked working capital). Reduce inventory where these are largest = recover EBITDA."
+        ),
     )
     c2.metric(
         "Understock", f"€ {total_understock:,.0f}",
@@ -1049,11 +1140,16 @@ with st.container(border=True):
 # ─── STRESS / LENS METRICS ───
 with st.container(border=True):
     st.markdown("### Stress & Lens Metrics")
-    st.caption("Surfaced separately — *not* summed into Total IVaR. These represent stress scenarios and P&L lenses, not expected loss.")
+    st.caption(
+        "Surfaced separately — *not* summed into Total IVaR. "
+        "These don't quantify recoverable EBITDA; they warn where reductions would create new risk. "
+        "Supply Continuity flags exposure if sole-source suppliers fail. "
+        "Margin Sensitivity flags amplified P&L impact on high-margin SKUs."
+    )
 
     l1, l2, l3, l4 = st.columns(4)
     l1.metric(
-        "Concentration (stress)", f"€ {total_concentration:,.0f}",
+        "Supply Continuity (stress)", f"€ {total_concentration:,.0f}",
         delta=f"{sole_source_count} sole-sourced materials", delta_color="inverse",
         help="Worst-case disruption cost across all sole-sourced materials — full supplier outage scenario, not probability-weighted.",
     )
@@ -1134,164 +1230,6 @@ with st.expander("📊 Portfolio IVaR — by Risk Source", expanded=True):
 # RISK MATRIX — Understock vs Overstock scatter
 # =============================================================================
 
-with st.expander("📊 Risk Matrix — Understock vs Overstock", expanded=True):
-    st.markdown(
-        '<div class="dim-note">'
-        'Each point = one material. '
-        '<b>Right</b> = overstock dominates (cash trapped). '
-        '<b>Up</b> = understock dominates (production / service at risk). '
-        '<b>Top-right</b> = both. '
-        '<b>Bottom-left</b> = controlled.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-# Pull all 6 additive dimensions so the hover can show a non-zero breakdown
-    scatter_df = ivar_df[[
-        "material", "description", "supplier",
-        "understock_ivar", "overstock_ivar", "lt_volatility_ivar",
-        "aging_ivar", "tariff_ivar", "commodity_ivar",
-        "total_ivar",
-    ]].copy()
-
-    # Pretty labels for the dimensions that appear in the hover breakdown
-    _hover_dim_labels = {
-        "understock_ivar":     "Understock",
-        "overstock_ivar":      "Overstock",
-        "lt_volatility_ivar":  "LT Volatility",
-        "aging_ivar":          "Aging / Expiry",
-        "tariff_ivar":         "Tariff / Country",
-        "commodity_ivar":      "Commodity Price",
-    }
-
-    def _fmt_eur_compact(v: float) -> str:
-        """Compact EUR for hover: €12.28M / €330k / €450."""
-        if v >= 1_000_000:
-            return f"€{v/1_000_000:.2f}M"
-        if v >= 1_000:
-            return f"€{v/1_000:.0f}k"
-        return f"€{v:.0f}"
-
-    def _build_hover_html(row: pd.Series) -> str:
-        # Main driver = highest non-zero additive dimension
-        dim_values = {label: row[col] for col, label in _hover_dim_labels.items() if row[col] > 0}
-        if dim_values:
-            top_label, top_value = max(dim_values.items(), key=lambda x: x[1])
-            total = row["total_ivar"]
-            pct = (top_value / total * 100) if total > 0 else 0
-            main_driver_line = f"<b>Main driver:</b> {top_label} ({pct:.0f}%)"
-        else:
-            main_driver_line = "<b>Main driver:</b> —"
-
-        # Breakdown — only non-zero dimensions, sorted descending
-        breakdown_rows = sorted(dim_values.items(), key=lambda x: x[1], reverse=True)
-        breakdown_lines = "".join(
-            f"<br>&nbsp;&nbsp;• {label}: {_fmt_eur_compact(v)}"
-            for label, v in breakdown_rows
-        )
-
-        return (
-            f"<b>{row['material']}</b> — {row['description']}<br>"
-            f"<i>{row['supplier']}</i><br>"
-            f"<b>Total IVaR:</b> {_fmt_eur_compact(row['total_ivar'])}<br>"
-            f"{main_driver_line}"
-            f"{breakdown_lines}"
-            "<extra></extra>"
-        )
-
-    scatter_df["__hover"] = scatter_df.apply(_build_hover_html, axis=1)
-    scatter_df = scatter_df.rename(columns={
-        "understock_ivar": "Understock IVaR (€)",
-        "overstock_ivar":  "Overstock IVaR (€)",
-        "total_ivar":      "Total IVaR (€)",
-    })
-
-    # Quadrant dividers — set at the median of NON-ZERO values so the cross
-    # lands in a sensible place even when most SKUs are at zero on one axis
-    x_vals = scatter_df["Overstock IVaR (€)"]
-    y_vals = scatter_df["Understock IVaR (€)"]
-    x_med = float(x_vals[x_vals > 0].median()) if (x_vals > 0).any() else 0.0
-    y_med = float(y_vals[y_vals > 0].median()) if (y_vals > 0).any() else 0.0
-
-    fig = px.scatter(
-        scatter_df,
-        x="Overstock IVaR (€)",
-        y="Understock IVaR (€)",
-        size="Total IVaR (€)",
-        color="Total IVaR (€)",
-        color_continuous_scale="Plasma",
-        size_max=30,
-        custom_data=["__hover"],
-    )
-
-    # Apply the custom rich hover and dot styling
-    fig.update_traces(
-        marker=dict(
-            line=dict(width=0.8, color="rgba(128,128,128,0.7)"),
-            opacity=0.85,
-        ),
-        hovertemplate="%{customdata[0]}",
-    )
-
-    # Quadrant divider lines (stay in data coordinates — they're anchored to the medians)
-    fig.add_hline(y=y_med, line_dash="dot", line_color="rgba(128,128,128,0.50)", line_width=1)
-    fig.add_vline(x=x_med, line_dash="dot", line_color="rgba(128,128,128,0.50)", line_width=1)
-
-    # Quadrant labels — paper-anchored (xref/yref = "paper") so they stay in
-    # the chart corners during zoom and pan. 0,0 = bottom-left; 1,1 = top-right.
-    annotations = [
-        dict(
-            x=0.99, y=0.99, xref="paper", yref="paper",
-            text="<b>Both</b><br><span style='font-size:10px;color:#999'>Critical</span>",
-            showarrow=False, font=dict(size=12, color="#C03A2C"),
-            align="right", xanchor="right", yanchor="top",
-        ),
-        dict(
-            x=0.01, y=0.99, xref="paper", yref="paper",
-            text="<b>Production at risk</b><br><span style='font-size:10px;color:#999'>Understock dominates</span>",
-            showarrow=False, font=dict(size=12, color="#6A1B9A"),
-            align="left", xanchor="left", yanchor="top",
-        ),
-        dict(
-            x=0.99, y=0.04, xref="paper", yref="paper",
-            text="<b>Cash trapped</b><br><span style='font-size:10px;color:#999'>Overstock dominates</span>",
-            showarrow=False, font=dict(size=12, color="#1565C0"),
-            align="right", xanchor="right", yanchor="bottom",
-        ),
-        dict(
-            x=0.01, y=0.04, xref="paper", yref="paper",
-            text="<b>Controlled</b><br><span style='font-size:10px;color:#999'>Low on both axes</span>",
-            showarrow=False, font=dict(size=12, color="#2E7D32"),
-            align="left", xanchor="left", yanchor="bottom",
-        ),
-    ]
-
-    fig.update_layout(
-        height=520,
-        margin=dict(l=10, r=10, t=20, b=40),
-        annotations=annotations,
-        xaxis=dict(
-            tickformat=",.0f", tickprefix="€ ",
-            gridcolor="rgba(128,128,128,0.20)", zerolinecolor="rgba(128,128,128,0.35)",
-        ),
-        yaxis=dict(
-            tickformat=",.0f", tickprefix="€ ",
-            gridcolor="rgba(128,128,128,0.20)", zerolinecolor="rgba(128,128,128,0.35)",
-        ),
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        coloraxis_colorbar=dict(
-            title=dict(text="Total IVaR (€)", side="right"),
-            tickformat=",.0f", tickprefix="€ ",
-        ),
-        hoverlabel=dict(
-            bgcolor="white",
-            bordercolor="rgba(128,128,128,0.4)",
-            font=dict(size=12, color="#222"),
-        ),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-st.markdown("---")
 
 
 # =============================================================================
@@ -1375,13 +1313,13 @@ st.dataframe(
     column_config={
         "Understock (€)":          st.column_config.NumberColumn(help="Days short of coverage × daily demand × (unit cost + margin)."),
         "Overstock (€)":           st.column_config.NumberColumn(help="Excess inventory above 1.5× safety stock × unit cost × holding rate × horizon / 365."),
-        "Concentration (€)":       st.column_config.NumberColumn(help="Worst-case sole-source outage: LT × factor × daily demand × (unit cost + margin). Stress scenario."),
+        "Supply Continuity (€)":   st.column_config.NumberColumn(help="Worst-case sole-source outage: lead time × factor × daily demand × (unit cost + margin). Stress scenario, not expected loss."),
         "LT Volatility (€)":       st.column_config.NumberColumn(help="z × CV(lead time) × LT × daily demand × unit cost × holding rate × horizon / 365. Requires LT history file."),
         "Margin Sensitivity (€)":  st.column_config.NumberColumn(help="P&L portion of Understock exposure on materials above the margin threshold. Lens — already inside Understock."),
         "Aging / Expiry (€)":      st.column_config.NumberColumn(help="Inventory value × obsolescence rate. Uses shelf-life data if provided, else aging-bucket method."),
         "Tariff / Country (€)":    st.column_config.NumberColumn(help="Inventory × unit cost × expected tariff change %. Applied to high-risk countries of origin by default."),
         "Commodity Price (€)":     st.column_config.NumberColumn(help="Horizon demand × unit cost × expected price change %. Replacement cost basis."),
-        "Total IVaR (€)":          st.column_config.NumberColumn(help="Sum of the six additive IVaR dimensions. Concentration and Margin Sensitivity are shown as lenses and are not included in Total IVaR."),
+        "Total IVaR (€)":          st.column_config.NumberColumn(help="Sum of the six additive IVaR dimensions. Supply Continuity and Margin Sensitivity are shown as lenses and are not included in Total IVaR."),
         "% of Total":              st.column_config.NumberColumn(help="This material's Total IVaR as a percentage of the full portfolio Total IVaR (sum across all 500 materials, not just those displayed)."),
     },
 )
@@ -1396,7 +1334,7 @@ st.markdown("---")
 sole_df = ivar_df[sole_source_mask].copy()
 
 if not sole_df.empty:
-    st.subheader("Concentration Risk — Sole-Source Materials")
+    st.subheader("Supply Continuity — Sole-Source Materials")
     st.markdown(
         f'<div class="dim-note">'
         f'Worst-case disruption scenario: full supplier outage lasting '
@@ -1420,7 +1358,7 @@ if not sole_df.empty:
         "supplier": "Supplier", "country_of_origin": "Country",
         "lead_time_days": "Lead Time (days)", "inventory_on_hand": "Inventory (units)",
         "unit_cost_eur": "Unit Cost (€)", "inventory_value_eur": "Inventory Value (€)",
-        "concentration_ivar": "Concentration IVaR (€)", "total_ivar": "Total IVaR (€)",
+        "concentration_ivar": "Supply Continuity IVaR (€)", "total_ivar": "Total IVaR (€)",
     }, inplace=True)
 
     st.dataframe(
@@ -1428,7 +1366,7 @@ if not sole_df.empty:
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Concentration IVaR (€)": st.column_config.NumberColumn(format="€%,.0f"),
+            "Supply Continuity IVaR (€)": st.column_config.NumberColumn(format="€%,.0f"),
             "Inventory Value (€)":    st.column_config.NumberColumn(format="€%,.0f"),
             "Total IVaR (€)":         st.column_config.NumberColumn(format="€%,.0f"),
             "Unit Cost (€)":          st.column_config.NumberColumn(format="€%.2f"),
@@ -1455,7 +1393,7 @@ k1, k2, k3, k4 = st.columns(4)
 k1.metric("Total IVaR",       f"€ {_safe(sel['total_ivar']):,.0f}")
 k2.metric("Understock",       f"€ {_safe(sel['understock_ivar']):,.0f}")
 k3.metric("Overstock",        f"€ {_safe(sel['overstock_ivar']):,.0f}")
-k4.metric("Concentration",    f"€ {_safe(sel['concentration_ivar']):,.0f}")
+k4.metric("Supply Continuity", f"€ {_safe(sel['concentration_ivar']):,.0f}")
 
 # KPI row 2
 k5, k6, k7, k8 = st.columns(4)
@@ -1545,10 +1483,10 @@ with st.expander("📋 Material inputs & model assumptions", expanded=False):
             f"{lt_cv_map.get(selected_mat, 0):.3f}" if lt_cv_map.get(selected_mat) else "No history uploaded",
         ],
         "Used in": [
-            "All dimensions", "Understock, Concentration, Margin Sensitivity",
-            "All dimensions", "Overstock", "Understock, Concentration, Margin Sensitivity, Commodity",
-            "Understock, Concentration, LT Volatility", "Derived",
-            "Display only", "Concentration IVaR", "Tariff / Country IVaR",
+            "All dimensions", "Understock, Supply Continuity, Margin Sensitivity",
+            "All dimensions", "Overstock", "Understock, Supply Continuity, Margin Sensitivity, Commodity",
+            "Understock, Supply Continuity, LT Volatility", "Derived",
+            "Display only", "Supply Continuity IVaR", "Tariff / Country IVaR",
              shelf_life_tag, days_oh_tag,
             "Commodity Price IVaR", "LT Volatility IVaR",
         ],
