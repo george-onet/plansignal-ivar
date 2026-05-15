@@ -787,7 +787,7 @@ st.markdown(
     'Inventory carrying cost and value at risk — quantified per material.'
     '</div>'
     '<div style="font-size: 0.95rem; color: #777; font-style: italic; margin-top: 2px; margin-bottom: 8px;">'
-    'Two sides of the same financial coin: where to reduce inventory, and where reductions would create new risk.'
+    'Where to reduce inventory, and where reductions would create new risk — on one screen.'
     '</div>',
     unsafe_allow_html=True,
 )
