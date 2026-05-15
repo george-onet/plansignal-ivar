@@ -30,11 +30,17 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from reportlab.lib import colors as rl_colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+
 # =============================================================================
 # CONSTANTS
 # =============================================================================
 
-APP_VERSION = "1.0"
+APP_VERSION = "2.0"
 LOG_FILE    = "ivar_usage_log.csv"
 TRUE_FLAG_VALUES = {"Y", "YES", "TRUE", "1", "X"}
 FALSE_FLAG_VALUES = {"N", "NO", "FALSE", "0", ""}
@@ -1496,18 +1502,211 @@ with st.expander("📋 Material inputs & model assumptions", expanded=False):
 
 st.markdown("---")
 
+# =============================================================================
+# PDF S&OP AGENDA
+# =============================================================================
+
+def build_sop_pdf(
+    ivar_df: pd.DataFrame,
+    params: IVaRParams,
+    items_per_band: int = 3,
+) -> bytes:
+    """
+    Generate a one-page S&amp;OP Action Agenda PDF.
+    
+    Header   : portfolio snapshot (inventory, target, gap, EBITDA at Risk)
+    Body     : three action category blocks, top N SKUs each
+    Footer   : model parameters + timestamp
+    
+    Designed to be the agenda sheet for an S&amp;OP meeting where Procurement
+    and Finance need to walk in with the same decisions in front of them.
+    """
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        rightMargin=1.6*cm, leftMargin=1.6*cm,
+        topMargin=1.4*cm, bottomMargin=1.2*cm,
+    )
+    
+    # ─── STYLES ───
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "Title", parent=styles["Heading1"],
+        fontSize=16, textColor=rl_colors.HexColor("#222"),
+        spaceAfter=4, alignment=0,
+    )
+    subtitle_style = ParagraphStyle(
+        "Subtitle", parent=styles["Normal"],
+        fontSize=9, textColor=rl_colors.HexColor("#666"),
+        spaceAfter=14, italic=True,
+    )
+    section_style = ParagraphStyle(
+        "Section", parent=styles["Heading2"],
+        fontSize=12, spaceBefore=10, spaceAfter=4,
+    )
+    decision_style = ParagraphStyle(
+        "Decision", parent=styles["Normal"],
+        fontSize=8.5, textColor=rl_colors.HexColor("#555"),
+        italic=True, spaceAfter=6,
+    )
+    footer_style = ParagraphStyle(
+        "Footer", parent=styles["Normal"],
+        fontSize=7.5, textColor=rl_colors.HexColor("#888"),
+        spaceBefore=14,
+    )
+    
+    # ─── COMPUTE PORTFOLIO HEADLINE NUMBERS ───
+    inv_value = (ivar_df["inventory_on_hand"] * ivar_df["unit_cost_eur"]).sum()
+    target    = params.inventory_target_eur if params.inventory_target_eur > 0 else inv_value
+    gap       = inv_value - target
+    total_ivar = ivar_df[RISK_COLS_ADDITIVE].sum().sum()
+    
+    elements = []
+    
+    # ─── HEADER ───
+    elements.append(Paragraph("PlanSignal IVaR — S&amp;OP Action Agenda", title_style))
+    elements.append(Paragraph(
+        f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
+        f"{len(ivar_df)} materials · "
+        f"{params.horizon_days}-day forward horizon",
+        subtitle_style,
+    ))
+    
+    # ─── PORTFOLIO SNAPSHOT TABLE ───
+    snapshot_data = [
+        ["Current inventory value", f"€ {inv_value:,.0f}"],
+        ["Finance target",          f"€ {target:,.0f}"],
+        ["Gap to target",           f"€ {gap:+,.0f}" + (" over" if gap > 0 else " under" if gap < 0 else "")],
+        ["EBITDA at Risk (Total IVaR)", f"€ {total_ivar:,.0f}"],
+    ]
+    snapshot = Table(snapshot_data, colWidths=[7*cm, 6*cm])
+    snapshot.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), rl_colors.HexColor("#F5F5F5")),
+        ("BACKGROUND", (0,2), (-1,2), rl_colors.HexColor("#FDF0EE")),
+        ("BACKGROUND", (0,3), (-1,3), rl_colors.HexColor("#FDF0EE")),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 10),
+        ("FONTNAME", (1,0), (1,-1), "Helvetica-Bold"),
+        ("ALIGN", (1,0), (1,-1), "RIGHT"),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+        ("TOPPADDING", (0,0), (-1,-1), 6),
+        ("LINEBELOW", (0,-1), (-1,-1), 0.4, rl_colors.HexColor("#CCC")),
+    ]))
+    elements.append(snapshot)
+    elements.append(Spacer(1, 0.4*cm))
+    
+    # ─── ACTION CATEGORY BLOCKS ───
+    for cat_key in sorted(ACTION_CATEGORIES.keys(), key=lambda k: ACTION_CATEGORIES[k]["rank"]):
+        cfg = ACTION_CATEGORIES[cat_key]
+        band_df = (
+            ivar_df[ivar_df["action_category"] == cat_key]
+            .sort_values("action_value_eur", ascending=False)
+            .head(items_per_band)
+        )
+        total_in_band = int((ivar_df["action_category"] == cat_key).sum())
+        eur_in_band = float(
+            ivar_df.loc[ivar_df["action_category"] == cat_key, "action_value_eur"].sum()
+        )
+        
+        # Section heading with color band
+        heading = Paragraph(
+            f'<font color="{cfg["color"]}"><b>■</b></font> &nbsp;'
+            f'<b>{cfg["label"]}</b> &nbsp;'
+            f'<font color="#888" size="9">'
+            f'({total_in_band} SKU{"s" if total_in_band != 1 else ""} · € {eur_in_band:,.0f} total)'
+            f'</font>',
+            section_style,
+        )
+        elements.append(heading)
+        elements.append(Paragraph(cfg["decision"], decision_style))
+        
+        if band_df.empty:
+            elements.append(Paragraph(
+                '<font color="#888" size="8.5"><i>No SKUs flagged in this band.</i></font>',
+                styles["Normal"],
+            ))
+            elements.append(Spacer(1, 0.3*cm))
+            continue
+        
+        # SKU table
+        table_data = [["Material", "Description", "Supplier", "Inventory €", "Trigger"]]
+        for _, row in band_df.iterrows():
+            table_data.append([
+                str(row.get("material", ""))[:14],
+                str(row.get("description", ""))[:22],
+                str(row.get("supplier", ""))[:20],
+                f"€ {row['action_value_eur']:,.0f}",
+                str(row.get("action_trigger", ""))[:38],
+            ])
+        
+        skus = Table(
+            table_data,
+            colWidths=[2.2*cm, 3.4*cm, 3.4*cm, 2.6*cm, 5.4*cm],
+            repeatRows=1,
+        )
+        skus.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), rl_colors.HexColor(cfg["color"])),
+            ("TEXTCOLOR",  (0,0), (-1,0), rl_colors.white),
+            ("FONTNAME",   (0,0), (-1,0), "Helvetica-Bold"),
+            ("FONTSIZE",   (0,0), (-1,-1), 8.5),
+            ("FONTNAME",   (0,1), (-1,-1), "Helvetica"),
+            ("ALIGN",      (3,0), (3,-1), "RIGHT"),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+            ("TOPPADDING",    (0,0), (-1,-1), 4),
+            ("GRID", (0,0), (-1,-1), 0.3, rl_colors.HexColor("#DDD")),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [rl_colors.white, rl_colors.HexColor("#FAFAFA")]),
+        ]))
+        elements.append(skus)
+        elements.append(Spacer(1, 0.3*cm))
+    
+    # ─── FOOTER ───
+    elements.append(Paragraph(
+        f"<b>Model parameters:</b> &nbsp;"
+        f"Holding cost {params.holding_cost_rate*100:.0f}%/yr · "
+        f"Horizon {params.horizon_days}d · "
+        f"Margin threshold {params.margin_critical_pct:.0f}% · "
+        f"Sole-source LT factor {params.sole_source_lt_factor:.1f}× · "
+        f"Tariff change {params.tariff_change_pct:.0f}% · "
+        f"In-transit {'included' if params.include_in_transit else 'excluded'}",
+        footer_style,
+    ))
+    elements.append(Paragraph(
+        f"PlanSignal IVaR v{APP_VERSION} · plansignal.streamlit.app",
+        footer_style,
+    ))
+    
+    doc.build(elements)
+    return buf.getvalue()
 
 # =============================================================================
 # EXPORT
 # =============================================================================
 
-excel_bytes = build_excel_export(ivar_df, params)
-st.download_button(
-    "Export IVaR Report (Excel)",
-    data=excel_bytes,
-    file_name=f"ivar_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+col_export_xlsx, col_export_pdf = st.columns(2)
+
+with col_export_xlsx:
+    excel_bytes = build_excel_export(ivar_df, params)
+    st.download_button(
+        "📊 Export IVaR Report (Excel)",
+        data=excel_bytes,
+        file_name=f"ivar_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+with col_export_pdf:
+    # Use the same items_per_band slider value that drives the on-screen Action List
+    # so what the user prints matches what they're looking at.
+    pdf_bytes = build_sop_pdf(ivar_df, params, items_per_band=items_per_band)
+    st.download_button(
+        "📄 Export S&amp;OP Agenda (PDF)",
+        data=pdf_bytes,
+        file_name=f"sop_agenda_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+        help="One-page S&amp;OP action agenda — portfolio snapshot + top SKUs per category.",
+    )
 
 st.caption(
     f"PlanSignal IVaR v{APP_VERSION} · "
