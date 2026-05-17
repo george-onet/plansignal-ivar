@@ -69,7 +69,7 @@ It's the tool I wished I'd had during seven years of production and supply plann
 
 ## About
 
-Built by **George Onet** — supply chain planning professional, 7+ years across production, supply, and distribution planning in chemical and pharmaceutical manufacturing. 
+Built by **George Onet** — supply chain planning professional, 7+ years across production, supply, and distribution planning in chemical manufacturing. 
 
 🔗 [LinkedIn](https://www.linkedin.com/in/george-onet) · 📂 [PlanSignal v1](https://planning-risk-app.streamlit.app) (finished goods risk prioritisation)
 
