@@ -69,6 +69,24 @@ RISK_COLS_ADDITIVE = [
     "commodity_ivar",
 ]
 
+# EBITDA at Risk — additive dimensions that hit operating earnings (P&L)
+RISK_COLS_EBITDA = [
+    "understock_ivar",      # lost gross margin from shortages
+    "aging_ivar",           # write-offs
+    "tariff_ivar",          # COGS revaluation
+    "commodity_ivar",       # forward cost gap
+]
+
+# Capital at Risk — additive dimensions that hit working capital (below EBITDA line)
+RISK_COLS_CAPITAL = [
+    "overstock_ivar",       # carrying cost on excess
+    "lt_volatility_ivar",   # additional holding cost from LT variability
+]
+# Note: RISK_COLS_EBITDA + RISK_COLS_CAPITAL == RISK_COLS_ADDITIVE
+# Conservative classification — operating-cost portion of holding rate
+# is genuinely an EBITDA hit, but is bundled into Capital at Risk for
+# defensive reporting (makes EBITDA at Risk a floor, not a ceiling).
+
 # Lens dimensions — surfaced separately, not summed into Total IVaR
 # (Supply Continuity is a stress scenario; Margin Sensitivity is a P&L lens
 # on Understock for high-margin SKUs)
@@ -258,12 +276,12 @@ def _inventory_with_transit(row: pd.Series, p: IVaRParams, ignore_horizon: bool 
 
 def _understock(row: pd.Series, p: IVaRParams) -> float:
     """
-    Inventory exposure from coverage shortfall.
-    
-    When stock is below the level needed to cover lead time, remaining inventory
-    is effectively locked — committed to firm orders/production runs and
-    unavailable for reduction. Exposure scales with shortfall severity:
-    the closer to zero coverage, the larger the locked share.
+    Lost gross margin from coverage shortfall before next replenishment arrives.
+
+    When stock cannot cover lead-time demand, the shortfall translates into
+    missed sales. Exposure = shortfall units × unit cost × (1 + margin) —
+    i.e. the gross revenue not earned over the shortfall window. This is the
+    EBITDA-recoverable component of Understock.
     """
     demand = _safe(row.get("avg_daily_demand"))
     if demand <= 0:
@@ -278,9 +296,10 @@ def _understock(row: pd.Series, p: IVaRParams) -> float:
     if coverage >= lt:
         return 0.0   # adequately covered — no inventory locked by shortfall
     
-    locked_fraction = (lt - coverage) / lt   # 0 at full coverage, 1 at zero coverage
-    inventory_value = inventory * cost
-    return inventory_value * locked_fraction
+    shortfall_days = lt - coverage
+    shortfall_units = shortfall_days * demand
+    margin = _safe(row.get("margin_pct"), 0) / 100
+    return shortfall_units * cost * (1 + margin)
 
 
 def _overstock(row: pd.Series, p: IVaRParams) -> float:
@@ -939,6 +958,11 @@ total_aging         = float(ivar_df["aging_ivar"].sum())
 total_tariff        = float(ivar_df["tariff_ivar"].sum())
 total_commodity     = float(ivar_df["commodity_ivar"].sum())
 
+# EBITDA / Capital split — for financial-reporting precision
+total_ebitda_at_risk  = total_understock + total_aging + total_tariff + total_commodity
+total_capital_at_risk = total_overstock + total_lt_volatility
+# Sanity: total_ebitda_at_risk + total_capital_at_risk == total_ivar
+
 # Lens totals (surfaced separately, NOT summed into Total IVaR)
 total_concentration = float(ivar_df["concentration_ivar"].sum())
 total_margin_sens   = float(ivar_df["margin_critical_ivar"].sum())
@@ -1094,53 +1118,83 @@ with st.container(border=True):
 
 # ─── EXPECTED LOSS (TOTAL IVaR) ───
 with st.container(border=True):
-    st.markdown("### Total IVaR — EBITDA at Risk")
+    st.markdown("### Total IVaR — Financial Exposure")
     st.caption(
         f"{total_materials} materials · "
         f"{horizon_days}-day forward horizon · "
         f"{holding_pct}% annual holding cost · "
-        f"sum of six additive dimensions — the EBITDA at risk in inventory over the horizon"
+        f"split into EBITDA at Risk (operating earnings) and Capital at Risk (working capital)"
     )
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(
-        "Total IVaR", f"€ {total_ivar:,.0f}",
+    # Headline summary — three tiles
+    s1, s2, s3 = st.columns(3)
+    s1.metric(
+        "Total Exposure", f"€ {total_ivar:,.0f}",
         help=(
-            "EBITDA at risk over the forward horizon — sum of six additive dimensions: "
-            "Overstock (carrying cost on excess), LT Volatility (extra safety stock cost), "
-            "Aging (write-off risk), Tariff (revaluation), Commodity (forward margin), "
-            "Understock (locked working capital). Reduce inventory where these are largest = recover EBITDA."
+            "Sum of all six additive dimensions across the portfolio. "
+            "Combines EBITDA at Risk (operating earnings exposure) and "
+            "Capital at Risk (working capital exposure, below the EBITDA line)."
         ),
     )
-    c2.metric(
-        "Understock", f"€ {total_understock:,.0f}",
-        help="Lost production / missed sales where inventory cannot cover the next replenishment cycle.",
+    pct_ebitda = (total_ebitda_at_risk / total_ivar * 100) if total_ivar else 0
+    s2.metric(
+        "EBITDA at Risk", f"€ {total_ebitda_at_risk:,.0f}",
+        delta=f"{pct_ebitda:.0f}% of total", delta_color="off",
+        help=(
+            "Exposure to operating earnings — flows through the P&L. "
+            "Understock (lost gross margin from shortages), Aging (write-offs), "
+            "Tariff (COGS revaluation), Commodity (forward cost gap)."
+        ),
     )
-    c3.metric(
-        "Overstock", f"€ {total_overstock:,.0f}",
-        help="Capital cost of excess inventory held above 1.5× safety stock over the forward horizon.",
-    )
-    c4.metric(
-        "LT Volatility", f"€ {total_lt_volatility:,.0f}",
-        help="Additional safety-stock holding cost driven by observed lead-time variability (requires LT history file).",
+    pct_capital = (total_capital_at_risk / total_ivar * 100) if total_ivar else 0
+    s3.metric(
+        "Capital at Risk", f"€ {total_capital_at_risk:,.0f}",
+        delta=f"{pct_capital:.0f}% of total", delta_color="off",
+        help=(
+            "Exposure to working capital — held below the EBITDA line. "
+            "Overstock (carrying cost on excess), LT Volatility (additional holding cost "
+            "from lead-time variability). Conservatively classified: the operating-cost "
+            "portion of holding rate is genuinely an EBITDA hit but is bundled here "
+            "for defensive reporting, making EBITDA at Risk a floor estimate."
+        ),
     )
 
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric(
+    st.markdown("---")
+
+    # EBITDA at Risk dimensions
+    st.markdown("**EBITDA at Risk** — operating earnings exposure")
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric(
+        "Understock", f"€ {total_understock:,.0f}",
+        help="Lost gross margin where coverage cannot meet lead-time demand. Shortfall units × cost × (1 + margin).",
+    )
+    e2.metric(
         "Aging / Expiry", f"€ {total_aging:,.0f}",
         help="Write-off risk from inventory nearing shelf-life expiry or aged beyond the obsolescence threshold.",
     )
-    c6.metric(
+    e3.metric(
         "Tariff / Country", f"€ {total_tariff:,.0f}",
         help=f"Inventory revaluation at {tariff_change_pct}% tariff change on high-risk countries of origin.",
     )
-    c7.metric(
+    e4.metric(
         "Commodity Price", f"€ {total_commodity:,.0f}",
         help="Replacement cost gap for horizon-period demand at expected input price changes.",
     )
-    c8.metric(
+
+    # Capital at Risk dimensions + High-Risk count
+    st.markdown("**Capital at Risk** — working capital / below-the-line exposure")
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "Overstock", f"€ {total_overstock:,.0f}",
+        help="Carrying cost on capital trapped in inventory above 1.5× safety stock over the forward horizon.",
+    )
+    c2.metric(
+        "LT Volatility", f"€ {total_lt_volatility:,.0f}",
+        help="Additional safety-stock holding cost driven by observed lead-time variability (requires LT history file).",
+    )
+    c3.metric(
         "High-Risk Materials", high_risk_count,
-        delta="top quartile by Total IVaR", delta_color="inverse",
+        delta="top quartile by Total Exposure", delta_color="inverse",
     )
 
 # ─── STRESS / LENS METRICS ───
@@ -1394,19 +1448,40 @@ desc_val = str(sel.get("description", "")).strip()
 title_str = f"**{selected_mat}**" + (f" — {desc_val}" if desc_val and desc_val.lower() != "nan" else "")
 st.markdown(title_str)
 
-# KPI row 1
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Total IVaR",       f"€ {_safe(sel['total_ivar']):,.0f}")
-k2.metric("Understock",       f"€ {_safe(sel['understock_ivar']):,.0f}")
-k3.metric("Overstock",        f"€ {_safe(sel['overstock_ivar']):,.0f}")
-k4.metric("Supply Continuity", f"€ {_safe(sel['concentration_ivar']):,.0f}")
+# Per-material EBITDA / Capital split
+sel_ebitda  = _safe(sel['understock_ivar']) + _safe(sel['aging_ivar']) + _safe(sel['tariff_ivar']) + _safe(sel['commodity_ivar'])
+sel_capital = _safe(sel['overstock_ivar'])  + _safe(sel['lt_volatility_ivar'])
 
-# KPI row 2
-k5, k6, k7, k8 = st.columns(4)
-k5.metric("Aging / Expiry",   f"€ {_safe(sel['aging_ivar']):,.0f}")
-k6.metric("Tariff / Country", f"€ {_safe(sel['tariff_ivar']):,.0f}")
-k7.metric("Commodity Price",  f"€ {_safe(sel['commodity_ivar']):,.0f}")
-k8.metric("LT Volatility",    f"€ {_safe(sel['lt_volatility_ivar']):,.0f}")
+# Summary row — three headline tiles
+sum1, sum2, sum3 = st.columns(3)
+sum1.metric("Total Exposure",  f"€ {_safe(sel['total_ivar']):,.0f}")
+sum2.metric("EBITDA at Risk",  f"€ {sel_ebitda:,.0f}")
+sum3.metric("Capital at Risk", f"€ {sel_capital:,.0f}")
+
+st.divider()
+
+# EBITDA at Risk block
+with st.container(border=True):
+    st.markdown("##### 📊 EBITDA at Risk — *operating earnings exposure*")
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Understock",        f"€ {_safe(sel['understock_ivar']):,.0f}")
+    k2.metric("Aging / Expiry",    f"€ {_safe(sel['aging_ivar']):,.0f}")
+    k3.metric("Tariff / Country",  f"€ {_safe(sel['tariff_ivar']):,.0f}")
+    k4.metric("Commodity Price",   f"€ {_safe(sel['commodity_ivar']):,.0f}")
+
+# Capital at Risk block
+with st.container(border=True):
+    st.markdown("##### 💰 Capital at Risk — *working capital / below-the-line*")
+    k5, k6 = st.columns(2)
+    k5.metric("Overstock",     f"€ {_safe(sel['overstock_ivar']):,.0f}")
+    k6.metric("LT Volatility", f"€ {_safe(sel['lt_volatility_ivar']):,.0f}")
+
+# Stress lens — separated cleanly
+with st.container(border=True):
+    st.markdown("##### ⚠️ Stress Lens — *not summed into Total Exposure*")
+    k7, k8 = st.columns(2)
+    k7.metric("Supply Continuity",   f"€ {_safe(sel['concentration_ivar']):,.0f}")
+    k8.metric("Margin Sensitivity",  f"€ {_safe(sel.get('margin_critical_ivar', 0)):,.0f}")
 
 # Decomposition bar
 wf = pd.DataFrame({
@@ -1560,7 +1635,9 @@ def build_sop_pdf(
     inv_value = (ivar_df["inventory_on_hand"] * ivar_df["unit_cost_eur"]).sum()
     target    = params.inventory_target_eur if params.inventory_target_eur > 0 else inv_value
     gap       = inv_value - target
-    total_ivar = ivar_df[RISK_COLS_ADDITIVE].sum().sum()
+    total_ivar          = ivar_df[RISK_COLS_ADDITIVE].sum().sum()
+    pdf_ebitda_at_risk  = ivar_df[RISK_COLS_EBITDA].sum().sum()
+    pdf_capital_at_risk = ivar_df[RISK_COLS_CAPITAL].sum().sum()
     
     elements = []
     
@@ -1578,13 +1655,17 @@ def build_sop_pdf(
         ["Current inventory value", f"€ {inv_value:,.0f}"],
         ["Finance target",          f"€ {target:,.0f}"],
         ["Gap to target",           f"€ {gap:+,.0f}" + (" over" if gap > 0 else " under" if gap < 0 else "")],
-        ["EBITDA at Risk (Total IVaR)", f"€ {total_ivar:,.0f}"],
+        ["EBITDA at Risk",          f"€ {pdf_ebitda_at_risk:,.0f}"],
+        ["Capital at Risk",         f"€ {pdf_capital_at_risk:,.0f}"],
+        ["Total Exposure",          f"€ {total_ivar:,.0f}"],
     ]
     snapshot = Table(snapshot_data, colWidths=[7*cm, 6*cm])
     snapshot.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), rl_colors.HexColor("#F5F5F5")),
         ("BACKGROUND", (0,2), (-1,2), rl_colors.HexColor("#FDF0EE")),
         ("BACKGROUND", (0,3), (-1,3), rl_colors.HexColor("#FDF0EE")),
+        ("BACKGROUND", (0,4), (-1,4), rl_colors.HexColor("#FDF0EE")),
+        ("BACKGROUND", (0,5), (-1,5), rl_colors.HexColor("#FBE5E0")),
         ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
         ("FONTSIZE", (0,0), (-1,-1), 10),
         ("FONTNAME", (1,0), (1,-1), "Helvetica-Bold"),
