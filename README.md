@@ -1,106 +1,79 @@
 # PlanSignal IVaR
 
-**Inventory financial exposure, quantified per material. One number Procurement and Finance can both stand behind.**
+**Inventory Value at Risk — quantifying inventory exposure in EUR for mid-market chemical and pharmaceutical manufacturers.**
 
-🔗 **Live app:** [plansignal-ivar.streamlit.app](https://plansignal-ivar.streamlit.app)
-
----
-
-## What it is
-
-PlanSignal IVaR turns raw material data into **Inventory Value at Risk** — a single EUR figure for every SKU, decomposed into six independent risk dimensions plus two stress lenses. Every euro is traceable to a formula and assumptions you can audit in-app.
-
-Built for mid-market chemical and pharmaceutical manufacturers (€50M–€500M revenue) where Procurement and Finance often calculate inventory exposure separately, on different spreadsheets, with different methods. IVaR gives both functions one source of truth.
-
-**Not** a reorder tool, not a forecasting model, not an MRP replacement. A decision-support layer that sits on top of whatever planning system you already run.
+🔗 **[Live demo](https://plansignal-ivar.streamlit.app)** · 📊 [LinkedIn series](https://www.linkedin.com/in/george-onet) · 🛠 Built with Python, Pandas, Streamlit
 
 ---
 
-## The model — six dimensions, two lenses
+## The problem
 
-**Six additive dimensions** (sum to Total IVaR):
+Mid-market manufacturers run two inventory conversations in parallel — and they rarely meet on the same screen.
 
-| Dimension | What it measures |
-|---|---|
-| Understock | Lost production / missed sales from running out |
-| Overstock | Cash trapped above 1.5× safety stock + holding cost |
-| LT Volatility | Extra safety stock needed to absorb lead-time variance |
-| Aging / Expiry | Write-off risk on materials nearing or past shelf life |
-| Tariff / Country | Revaluation exposure on trade policy change |
-| Commodity Price | Replacement cost gap on input price moves |
+**Plants** track local, volume-based KPIs: stock on hand, days of cover, service level. Monthly cadence. Physical units.
 
-**Two stress lenses** (surfaced separately, not summed into Total IVaR):
+**Finance** tracks global, value-based KPIs: working capital, EBITDA exposure, write-off risk. Quarterly cadence. Euros.
 
-| Lens | What it measures |
-|---|---|
-| Concentration | Worst-case single-source disruption scenario |
-| Margin Sensitivity | P&L amplification on Understock for high-margin SKUs |
+When the gap shows up late in the year, the pressure to cut inventory fast forces decisions made on the wrong metric. Procurement and Finance reach different conclusions from different spreadsheets. The cuts that *get* made aren't always the cuts that *should* be made.
 
-The separation matters. Additive dimensions are expected-loss exposures. Lenses are scenario stress tests. Mixing them double-counts.
+PlanSignal IVaR closes that gap by translating inventory position into one financial risk figure — per material, fully traceable, in EUR.
 
----
+## What it does
 
-## How it works
+Upload two standard ERP exports. In seconds, the model produces:
 
-1. Upload your material master (xlsx or csv). One row per SKU. Mixed numeric formats, country code variants, dirty material codes — the loader handles it.
-2. Optional: upload lead-time history to unlock the LT Volatility dimension.
-3. Adjust six sidebar parameters to match your business: holding cost rate, forward horizon, margin-sensitivity threshold, concentration outage multiplier, tariff exposure assumption, aging threshold.
-4. Read the portfolio summary, drill into individual SKUs, export to Excel.
+- **Total Financial Exposure** split into **EBITDA at Risk** (operating earnings) and **Capital at Risk** (working capital, below the EBITDA line)
+- Six additive risk dimensions: **Understock**, **Aging / Expiry**, **Tariff / Country**, **Commodity Price** *(EBITDA-recoverable)* and **Overstock**, **LT Volatility** *(capital-recoverable)*
+- Two stress lenses: **Supply Continuity** (sole-source outage scenario) and **Margin Sensitivity** (P&L impact on high-margin SKUs)
+- A prioritised **Action List** surfacing SKUs by decision category — Trapped Working Capital, Shelf-life Risk, Single-source Liability
+- A one-click **S&OP Agenda PDF** so Procurement and Finance walk into the meeting with the same sheet
 
-Every figure in every drilldown comes with a "Material inputs & model assumptions" panel that names the formula and the inputs used. No black box.
+Every EUR figure is independently auditable. Hover any column header for the formula. Open the per-material drilldown for the full decomposition.
 
----
+## How to use it
 
-## Data inputs
+1. Open [plansignal-ivar.streamlit.app](https://plansignal-ivar.streamlit.app) — demo data is preloaded
+2. Adjust the sidebar parameters (holding cost rate, forward horizon, tariff exposure, margin threshold) to match your business
+3. Upload your own data when ready — standard ERP column names auto-map
 
-**Required columns** (any reasonable spelling — the loader normalises):
+To run locally:
 
-- `material` — SKU code
-- `unit_cost_eur`
-- `inventory_on_hand`
-- `avg_daily_demand`
-- `lead_time_days`
+```bash
+git clone https://github.com/george-onet/plansignal-ivar.git
+cd plansignal-ivar
+pip install -r requirements.txt
+streamlit run ivar_app.py
+```
 
-**Optional columns** (unlock additional dimensions when present):
+## Methodology
 
-- `safety_stock` → Overstock (treated as 0 if absent — conservative)
-- `margin_pct` → Margin Sensitivity
-- `sole_source` → Concentration
-- `country_of_origin` → Tariff / Country
-- `shelf_life_days` + `days_on_hand` → Aging / Expiry (precise path)
-- `expected_price_change_pct` → Commodity Price
+PlanSignal IVaR models inventory exposure across six additive financial risk dimensions, separated into **EBITDA at Risk** (Understock, Aging, Tariff, Commodity — all flow through the P&L) and **Capital at Risk** (Overstock, LT Volatility — both rest on holding-cost-based carrying charges).
 
-Missing optional columns return €0 for that dimension — no crashes, no inferred values.
+Holding cost is modeled at a fully-loaded annual rate per industry convention. Strictly, the cost-of-capital portion sits below the EBITDA line; the operating portion is the EBITDA-recoverable component. All holding-cost-based exposures are conservatively classified as Capital at Risk — making EBITDA at Risk a defensive floor estimate rather than a ceiling.
 
----
+The model has been stress-tested on a 500-material messy portfolio across sixteen edge cases including format inconsistencies, sole-source flag variants, zero and negative margin SKUs, past-expiry inventory, perfect-reliability and high-volatility lead time data, and sparse-observation filters. Math reconciles to the euro at both portfolio and material level.
 
-## Stress tested
+For dimension-by-dimension formulas and assumptions, see the in-app methodology expanders and the LinkedIn series Parts I–IIIb.
 
-500-SKU portfolio with planted edge cases including: mixed currency formats (`$45.20`, `12,5 €`, `£12.50`, `USD 22`), country code variants (`CN` / `chn` / `CHN` / ` BE `), 15 sole-source flag spellings, 8 negative-margin SKUs, 15 zero-margin SKUs, 8 out-of-stock SKUs, 2 past-expiry SKUs, 20 long-lead-time imports, plus an 8,866-row lead-time history file with 3 ghost materials and 20 NaN observations.
+## Tech stack
 
-Every dimension audited. Every silent failure mode probed. Five independent SKUs spot-checked against hand-calculated LT Volatility predictions — all matched to the euro.
+Python 3.11 · Pandas · NumPy · Streamlit · SQLite (action status persistence) · ReportLab (PDF export)
 
----
+## Why I built this
 
-## Built with
+During my research, the same issue kept resurfacing: mid-market manufacturers face a persistent disconnect between volume-driven local KPIs and value-based global inventory targets. Plants hit their local numbers while the business still misses the global EBITDA target — and by the time the gap shows up, the cuts that get made aren't always the cuts that should be made.
 
-- Python 3.11
-- Streamlit
-- pandas, numpy
-- openpyxl
+PlanSignal IVaR is my answer: a tool that translates inventory position into a single financial language, aligning Procurement and Finance on a unified assessment so decisions are driven by the same clean metrics.
 
-Single-file Streamlit app. No database. State is the uploaded file.
+It's the tool I wished I'd had during seven years of production and supply planning at Synthomer, Cargill, Eastman, DS Smith, Booking.com, and Arlon Graphics.
 
----
+## About
 
-## Origin
+Built by **George Onet** — supply chain planning professional, 7+ years across production, supply, and distribution planning in chemical and pharmaceutical manufacturing. 
 
-PlanSignal IVaR is the upstream-materials counterpart to [PlanSignal v1](https://plansignal.streamlit.app), which handles finished-goods forecast risk. Both are portfolio projects built by [George Onet](https://www.linkedin.com/in/georgeonet/)  — a supply chain professional with 7+ years in chemical manufacturing, documenting the build journey publicly on LinkedIn.
-
-The model reflects choices a planner makes daily. The code reflects choices a self-taught Python builder makes weekly. Both are open to scrutiny.
-
----
+🔗 [LinkedIn](https://www.linkedin.com/in/george-onet) · 📂 [PlanSignal v1](https://planning-risk-app.streamlit.app) (finished goods risk prioritisation)
 
 ## License
 
-No license. Code is public for review and learning. Reuse beyond personal study requires written permission.
+MIT — see [LICENSE](./LICENSE).
+
