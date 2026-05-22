@@ -65,11 +65,11 @@ During my research, the same issue kept resurfacing: mid-market manufacturers fa
 
 PlanSignal IVaR is my answer: a tool that translates inventory position into a single financial language, aligning Procurement and Finance on a unified assessment so decisions are driven by the same clean metrics.
 
-It's the tool I wished I'd had during seven years of production and supply planning at Synthomer, Cargill, Eastman, DS Smith, Booking.com, and Arlon Graphics.
+It's the tool I wished I'd had during my years in production and supply planning.
 
 ## About
 
-Built by **George Onet** — supply chain planning professional, 7+ years across production, supply, and distribution planning in chemical manufacturing. 
+Built by **George Onet** — supply chain planning professional with over 5 years across production, supply, and distribution planning in complex manufacturing environment. 
 
 🔗 [LinkedIn](https://www.linkedin.com/in/george-onet) · 📂 [PlanSignal v1](https://planning-risk-app.streamlit.app) (finished goods risk prioritisation)
 
